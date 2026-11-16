@@ -1,8 +1,9 @@
 # distillery
 
-A decision engine: distills a project's docs and code into the key facts, each cited to its source and confirmed by a person.
+A decision engine: distill a project's docs and code into key facts, cited by source, confirmed by humans.
 
-The first version distills the Markdown docs in a git repo, finding stale, redundant and conflicting claims, and links each fact to the source code it describes.
+v1 distills Markdown docs in git repos. Find stale, redundant, and conflicting claims. Link facts to source code.
 
-- [docs/decisions.md](docs/decisions.md): the current decisions, with citations
-- [transcripts/](transcripts/): the design sessions those decisions cite
+- [docs/decisions.md](docs/decisions.md): current decisions, cited
+- [docs/mvp-plan.md](docs/mvp-plan.md): MVP development plan
+- [transcripts/](transcripts/): prompts & transcripts
