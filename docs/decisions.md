@@ -12,32 +12,35 @@ The current decisions. Each section numbers its own decisions with its letter, m
 
 ## M: MVP
 
-- **M1.** The MVP distills docs, as a proof of concept for the visual decision tree and requirements system. [9]
+- **M1.** The MVP distills docs, as a proof of concept for the visual decision tree and requirements system. v1, described in the README, is the end state after iterating; the MVP is its first step. [9] [95]
 - **M2.** Goal: show distillation working. Docs become concise, cited and meaningful, without meandering language or obvious AI phrasing. [10] [11]
 - **M3.** Claim extraction is built first, as the essence of docs distillation. [12]
 - **M4.** The focus is the essence of the docs: claims, decisions and the user interface. Nothing checks the code automatically. [13]
 - **M5.** Built in small, isolated changes, to iterate quickly without scope creep. Building it and trying ideas matters more than planning every detail. [14] [15]
-- **M6.** A Rust web server: the user pastes a git repo URL, the analysis runs, and the distilled docs appear with clickable citations. In the MVP, citations open the docs they came from; citations into the source code come later (L2). [16] [13]
+- **M6.** A Rust web server: the user pastes a git repo URL, the analysis runs, and the distilled docs appear with clickable citations. In the MVP, citations open the docs they came from; citations into the source code come later (L2). [16] [13] [94]
 - **M7.** Input: only the Markdown docs in a repo that also holds the code. [17] [18] [19]
 - **M8.** Each run reads one snapshot and records its commit hash, so citations stay accurate for that hash. Runs can process a few files at a time, and distillation is incremental and handles failures. [20] [21] [22] [23]
-- **M9.** It finds stale information, redundancy, conflicting claims and needless detail, and has an interface for human review. [18] [24]
-- **M10.** Output: the distilled docs, plus commands for the user to create a PR that updates the docs. [25]
-- **M11.** Functional features come first: processing docs and making decisions on them. The data structure matters more than the visualization. [26] [27]
-- **M12.** Pages are rendered server-side in Rust with maud, as HTML and JavaScript. [28] [29]
-- **M13.** Uses only the Anthropic API, behind a platform-agnostic design. [30] [31] [32]
-- **M14.** What counts as one distilled fact is worked out by trying the process on real projects, without building for any specific repo. [33] [34]
+- **M9.** Every stage reports progress on the command line and in the web interface: what is being processed, record counts, the current item, and a progress bar or percentage. The interface explains each step and never appears frozen. [96] [97] [98]
+- **M10.** It finds stale information, redundancy, conflicting claims and needless detail, and has an interface for human review. [18] [24]
+- **M11.** Output: the distilled docs, plus commands for the user to create a PR that updates the docs. [25]
+- **M12.** Functional features come first: processing docs and making decisions on them. The data structure matters more than the visualization. [26] [27]
+- **M13.** Pages are rendered server-side in Rust with maud and served on localhost only, since the MVP has no login. Plain HTML, with no JavaScript or keyboard shortcuts until a page needs them. [28] [29] [99] [100]
+- **M14.** Uses only the Anthropic API, through its REST API rather than an SDK, behind a platform-agnostic design. [30] [31] [32] [101]
+- **M15.** What counts as one distilled fact is worked out by trying the process on real projects, without building for any specific repo. [33] [34]
+- **M16.** Settled for the MVP: sections, extraction schemas, validation, runs and failures, and the build order. The data model, claim kinds and link types are starting points, iterated during development. [102] [103]
 
 ## P: How distillation works
 
 - **P1.** Stages, each feeding the next: distill the docs; reviewers confirm facts against their own knowledge, which builds a requirements doc; check the code against the requirements; distill the code to its functional parts; improve implementations and data structures; finish with a security audit that proves everything works as intended and allows no unauthorized access. [35] [36] [37] [38] [39] [40]
 - **P2.** Docs generated from the code are part of the distillation report, including for legacy projects with no docs. The same process runs on projects with and without docs, so docs generated from the code alone can be compared with what the docs say. [41] [42]
 - **P3.** Every decision is confirmed by a person, who is recorded. Users resolve conflicts and make decisions, and the audit trail records each decision, the reason for it and its cited sources. [43] [44] [45]
-- **P4.** Claims nest like atoms and molecules. Atoms are the minimal decisions in a system; molecules are claims made of, or depending on, other claims. The data structure captures both. [46] [47] [48]
-- **P5.** Docs content is processed without assuming a format. Tables, for example, can hold findings, simulation output or hardware choices. [49] [50]
-- **P6.** Claim kinds start from a preliminary set: behavior, configuration, requirement, decision, instruction and rationale. [51]
-- **P7.** Reviewers approve decisions for specific departments, sections of a project, or repos. [52]
-- **P8.** Every analysis starts with the user declaring the source of truth. [53]
-- **P9.** Each project's structure is discovered from its own evidence, never assumed from another project. [54]
+- **P4.** Records written by AI agents are flagged as AI proposals until a person reviews them, so assumptions never become documented requirements without human review. [104]
+- **P5.** Claims nest. Atomic claims are the minimal decisions in a system; compound claims are made of, or depend on, other claims. The data structure captures both. Atoms and molecules were an illustration, not names. [46] [47] [48] [105] [106]
+- **P6.** Docs content is processed without assuming a format. Tables, for example, can hold findings, simulation output or hardware choices. [49] [50]
+- **P7.** Claim kinds start from a preliminary set: behavior, configuration, requirement, decision, instruction and rationale. [51]
+- **P8.** Reviewers approve decisions for specific departments, sections of a project, or repos. [52]
+- **P9.** Every analysis starts with the user declaring the source of truth. [53]
+- **P10.** Each project's structure is discovered from its own evidence, never assumed from another project. [54]
 
 ## R: How decisions are recorded
 
@@ -49,6 +52,8 @@ The current decisions. Each section numbers its own decisions with its letter, m
 - **R6.** Code changes and conversations are kept as concise as possible. [65]
 - **R7.** Docs are written once, from the final agreed state, instead of being rewritten along the way. [66]
 - **R8.** Planning docs have no open questions. Details are settled in discussion first, then handed off as a concise development plan. [67] [68]
+- **R9.** Writing describes categories in short noun phrases, not single objects or imagined examples, and cuts fluff. Distillation applies the same rules, even to a short README. [107] [108]
+- **R10.** Terms are defined once, in a small table in the MVP plan, with no separate glossary doc. [103] [109] [110]
 
 ## I: Implementation
 
@@ -57,9 +62,13 @@ The current decisions. Each section numbers its own decisions with its letter, m
 - **I3.** Distillery's Rust server runs the agent loop, so the model is easy to swap, and no vendor's agent SDK locks it in. [72] [73]
 - **I4.** Designed for on-premises hosting soon after the MVP, which opens Distillery to a much broader set of problems. [74] [75]
 - **I5.** LLMs distill docs. Code analysis uses traditional tools wherever possible; the specific tools are still to be chosen. [76] [77]
-- **I6.** Storage is rusqlite for the prototype. This isn't final: ORMs get compared once the data model settles. [78] [79]
+- **I6.** Storage is rusqlite for the prototype, set up like web-of-trust: schema steps tracked by SQLite's `user_version`, with no migration crate. This isn't final: ORMs get compared once the data model settles. [78] [79] [111]
 - **I7.** Markdown is parsed with pulldown-cmark. [80]
 - **I8.** Native git commands wherever possible. [81]
+- **I9.** axum with tokio for the web server. [99]
+- **I10.** reqwest for model API calls. [101]
+- **I11.** Settings live in a TOML config file, laid out like lurkers' `lurker.example.toml`: reviewer, model, port, database path and clone folder. Repositories are user input, added through the web interface. [112] [113] [114] [115] [116]
+- **I12.** Prompts and tool schemas are tracked in git. The prompt version is their hash, identifying records that need re-running. [117]
 
 ## L: Later
 
@@ -168,3 +177,27 @@ The current decisions. Each section numbers its own decisions with its letter, m
 91. [transcripts/2026-11-12-design-session-3.md](../transcripts/2026-11-12-design-session-3.md) line 324: "Much of this is out of the scope of the MVP"
 92. [transcripts/2026-11-11-design-session.md](../transcripts/2026-11-11-design-session.md) line 238: "We can automatically flag things like where someone submits a PR with code that conflicts against the confirmed requirements for the project, and only allow new code to be merged when it has cited documentation."
 93. [transcripts/2026-11-11-design-session.md](../transcripts/2026-11-11-design-session.md) line 129: "Ideal end state: PRs against the repo, issues created, integration with Linear."
+94. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 196: "The original idea of the project was to cite everything based on claims in source code, but we have reduced the scope for the MVP to focus on distilling markdown docs files."
+95. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 196: "refers to the desired end state after we iterate, not just the first commit of the first MVP we build."
+96. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 94: "command line progress reports as well as a way of viewing the same progress updates through the web interface"
+97. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 94: "It's really important that our UI is always clear and never appears to be frozen / blocking."
+98. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 94: "show what is being processed, how many records exist, what the current iterator is, a progress bar or at a minimum a percentage complete at all times"
+99. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 89: "Agreed, MVP has no login so localhost only"
+100. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 90: "No javascript is fine, let's keep this minimal until we need it, no need for keyboard shortcuts in an MVP."
+101. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 92: "Reqwest is approved, REST API is better than a SDK since it's more platform agnostic anyway"
+102. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 98: "However things like pipeline checks, and the final data model are large projects in themselves to be iterated on later"
+103. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 288: "Yes let's keep a minimal glossary of terms so we can keep everything consistent"
+104. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 97: "Decisions made by AI should always be flagged as such so that they can be reviewed and we avoid the situation where an assumption becomes a documented technical requirement without human review"
+105. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 200: "this was intended to be an illustrative example not a specific naming request"
+106. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 287: "Atomic claims and compound claims sounds good"
+107. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 99: "I noticed there were certain things that did not adhere to the writing guidelines, specifically referring to things as singular objects instead of categories."
+108. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 99: "Even a short readme file with a few sentences could be condensed. AI writing loves adding fluff"
+109. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 288: "I question if a separate glossary doc is actually necessary or if we can just use a small table"
+110. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 202: "Let's be clear about the language we're using"
+111. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 91: "let's use a similar setup to web-of-trust so we can keep things minimal without dependencies where it makes sense"
+112. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 93: "I would prefer to have a config file instead of command line arguments."
+113. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 204: "Config file structure confirmed, except for the previous note I made regarding the repos."
+114. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 95: "Reviewer can be an option in the config file for now"
+115. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 198: "The repos would be added to the project via the UI, not a config file."
+116. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 286: "It's fine to keep repos in a specific directory defined via the config, I like that idea actually"
+117. [transcripts/2026-11-16-design-session-4.md](../transcripts/2026-11-16-design-session-4.md) line 96: "Sounds good to keep the prompt tracked in git with a hash so we can tell the version and what records need to be updated"

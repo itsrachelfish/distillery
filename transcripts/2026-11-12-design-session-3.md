@@ -1,4 +1,4 @@
-# Transcript: Distillery design session 3, 2026-11-12 to 2026-11-14
+# Transcript: Distillery design session 3, 2026-11-12 to 2026-11-16
 
 Participants: Rachel Fish, Claude (Opus 5.5, Anthropic). Times are America/Denver (MST). Continues [session 2](2026-11-11-design-session-2.md). Tool calls are omitted. Diagrams are replaced by a note naming the diagram shown; [docs/mvp-plan.md](../docs/mvp-plan.md) has the pipeline and data model diagrams. Message text is verbatim, except that citation markup is removed from Claude's messages and blank lines separate Rachel's one-line paragraphs.
 

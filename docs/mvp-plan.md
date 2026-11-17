@@ -1,48 +1,94 @@
 # MVP development plan
 
-How the MVP gets built. Numbers such as M3 refer to [decisions.md](decisions.md). Anything without a decision number is Claude's proposed implementation, and needs to be discussed in the next session before development can continue. Items marked *Proposal* are choices no decision covers yet.
+How the MVP gets built. Numbers such as M3 refer to [decisions.md](decisions.md). Everything here is settled for the MVP (M16), except items marked:
+
+- ***Starting point:*** iterated during development.
+- ***Proposal:*** not yet signed off. Choices that no decision covers are marked *Proposed by* with the agent's name, and listed in the PR, until Rachel Fish signs them off (P4).
+
+## Terms
+
+| Term | Meaning |
+|---|---|
+| MVP | The first build: Markdown docs distillation |
+| v1 | The end state described in the README |
+| Run | One commit, the selected files, the model and the prompt version |
+| Stage | One step of document processing, from snapshot to distilled docs |
+| Section | Markdown under one heading, with its line range |
+| Span | Exact quote and line range at one commit |
+| Atomic claim | Claim quoting one span |
+| Compound claim | Claim made of other claims |
+| Link | Relation between two claims |
+| Finding | Duplicate, conflicting or stale claims |
+| Decision | Ruling by a person on claims or findings, with a reason and cited spans |
+| Party | Author of a record: person, team, vendor or AI agent |
+| AI proposal | Record written by an AI agent, not yet confirmed by a person |
+| Validation | Deterministic checks on model output before saving |
 
 ## Scope
 
 | In the MVP | After the MVP |
 |---|---|
 | Markdown docs in a git repo, pinned to one commit (M7, M8) | PDFs (L1) |
-| Claims, decisions and the review interface (M4) | Connecting docs to the code and checking them against it (L2) |
+| Claims, decisions and the review interface (M4) | Citations into source code, and checking docs against code (L2) |
 | A few files per run, resumable after failures (M8) | Other model platforms (L3) |
-| Anthropic API behind a platform-agnostic trait (M13) | An ORM, chosen once the data model settles (I6) |
-| Server-rendered pages (M12) | Graph and diagram views (R2) |
+| Progress at every stage, on the command line and the web (M9) | An ORM, chosen once the data model settles (I6) |
+| Anthropic REST API behind a platform-agnostic trait (M14) | Graph and diagram views (R2) |
+| Server-rendered pages on localhost, without JavaScript (M13) | CI integration (L8) |
 
-## Pipeline
+## Stages
 
 ```mermaid
 flowchart TD
     snap["Snapshot<br/>Clone at one commit"]
     pick["Select files<br/>A few docs at a time"]
-    atoms["Atoms<br/>LLM extracts, quotes verified"]
-    mol["Molecules and links<br/>Parts, duplicates, conflicts"]
-    rev["Human review<br/>Confirm, reject, pick a side"]
+    atoms["Atomic claims<br/>LLM extracts, quotes validated"]
+    compound["Compound claims and links<br/>Parts, duplicates, conflicts"]
+    rev["Review<br/>Confirm, reject, pick a side"]
     out["Distilled docs<br/>Cited claims, PR commands"]
     snap --> pick
     pick --> atoms
-    atoms --> mol
-    mol --> rev
+    atoms --> compound
+    compound --> rev
     rev --> out
     classDef llm fill:#EEEDFE,stroke:#534AB7,color:#3C3489
-    class atoms,mol llm
+    class atoms,compound llm
 ```
 
-Purple steps are LLM proposals. Everything else is deterministic or done by people.
+Purple stages produce AI proposals (P4). Everything else is deterministic or done by people.
 
-| Stage | What it does | Check |
+| Stage | What it does | Guarantee |
 |---|---|---|
-| Snapshot | `git clone`, `git rev-parse HEAD`, `git ls-files` for Markdown (I8) | Commit hash recorded on the run (M8) |
-| Select files | The user picks which files this run processes (M8) | Cached sections are skipped |
-| Atoms | Extract atomic claims from each section (M3, P4) | Each quote must appear in its section word for word |
-| Molecules and links | Group atoms into molecules and link related claims across the run's files | Every part and link points to an existing claim |
-| Human review | Users confirm, reject, edit or pick a side, with a reason (P3) | Decisions cite spans |
-| Distilled docs | Render confirmed claims with references, plus PR commands (M10) | Every claim is kept, merged or rejected |
+| Snapshot | `git clone` into the clone folder, `git rev-parse HEAD`, `git ls-files` for Markdown (I8) | Commit hash recorded on the run (M8) |
+| Select files | Files picked in the web interface for this run (M8) | Cached sections skipped |
+| Atomic claims | Claims extracted from each section (M3, P5) | Each quote appears in its section word for word |
+| Compound claims and links | Claims grouped into compound claims; related claims linked across the run's files | Every part and link points to an existing claim |
+| Review | People confirm, reject, edit or pick a side, with a reason (P3) | Decisions cite spans |
+| Distilled docs | Confirmed claims rendered with references, plus PR commands (M11) | Every claim kept, merged or rejected |
+
+## Progress
+
+The command line and the web interface show the same progress at every stage, so the interface never appears frozen (M9).
+
+- **Progress module,** modeled on web-of-trust's `progress.rs`: stages with a label, a total and a unit; updates naming the current item; a summary line and duration at the end of each stage.
+- **Terminal:** one line redrawn in place, or plain lines every few seconds when output isn't a terminal.
+- **Web:** the same report on the run page, reloading every 2 seconds with `<meta http-equiv="refresh">`.
+- **History:** stage summaries and durations saved with the run.
+
+| Stage | Shown while running |
+|---|---|
+| Snapshot | git's clone progress: objects received, percentage |
+| Select files | Markdown files found, files selected |
+| Sections | Sections per file, cached and to send |
+| Atomic claims | Section *n* of total, percentage, file and line range, attempt number, elapsed time of the current model call |
+| Validation | Quotes and IDs validated and rejected |
+| Compound claims and links | Claims sent, compound claims and links recorded |
+| Retries | Reason and countdown |
+
+Model calls have no percentage, so the run page shows a running clock per call. Streaming responses to show claims as they arrive comes later, only if long calls still look stuck.
 
 ## Data model
+
+*Starting point*
 
 ```mermaid
 flowchart TD
@@ -51,7 +97,7 @@ flowchart TD
     revision["Revision<br/>Commit SHA"]
     span["Span<br/>Exact quote and lines"]
     run["Run<br/>Files, model, prompt version"]
-    claim["Claim<br/>Atom or molecule"]
+    claim["Claim<br/>Atomic or compound"]
     finding["Finding<br/>Duplicate, conflict, stale"]
     decision["Decision<br/>Who, why, scope"]
     party -->|owns| source
@@ -73,63 +119,69 @@ flowchart TD
 ```
 
 - **Spans** are fixed to one commit, so citations stay accurate for that run (M8).
-- **Atoms** cite exactly one span. **Molecules** list their parts, which can be atoms or other molecules (P4).
+- **Atomic claims** cite exactly one span. **Compound claims** list their parts: atomic or compound claims (P5).
 - **Claim links:** part of, depends on, supports, opposes, duplicates and conflicts with.
-- **Authorship:** every claim and decision records its author and status (proposed, confirmed, rejected). AI agents are parties too (C5).
-- **Rejections flow upward:** rejecting a claim flags every molecule and claim that depends on it. A decision whose support never reaches a person's confirmation is flagged as an unconfirmed assumption (C5).
-- **Decisions** are never edited. A change is a new decision that supersedes the old one (P3).
+- **Authorship:** claims, links, findings and decisions record their author and status (proposed, confirmed, rejected). AI agents are parties too (C5). Records from AI agents show an "AI proposal" label in every view until a person confirms them (P4).
+- **Reviewer:** decisions made through the server are recorded as the reviewer in the config file (P3).
+- **Rejections flow upward:** rejected claims flag every claim that depends on them. Decisions whose support never reaches a person's confirmation are flagged as unconfirmed assumptions (C5).
+- **Decisions** are never edited. Changes are new decisions that supersede the old ones (P3).
 
 ## Claim extraction
 
-Built first (M3), in two passes. The model must answer through tools, and Distillery checks every answer.
+Built first (M3), in two passes. Every call forces one tool with strict tool use, so replies always match the schema, and validation checks the content. Prompts and tool schemas are files tracked in git; the prompt version is their hash (I12).
 
-**Pass 1, atoms:** one call per section. Tables, lists and code blocks are sent as written, with their line numbers. No format is assumed (P5).
+**Pass 1, atomic claims:** one call per section. Tables, lists and code blocks are sent as written, with their line numbers. No format is assumed (P6).
 
 ```json
 {
-  "name": "record_atoms",
+  "name": "record_claims",
   "description": "Record each atomic claim in this section: one piece of information, quoted exactly.",
+  "strict": true,
   "input_schema": {
     "type": "object",
     "properties": {
-      "atoms": {
+      "claims": {
         "type": "array",
         "items": {
           "type": "object",
           "properties": {
             "text": { "type": "string", "description": "The claim as one concise statement" },
-            "kind": { "enum": ["behavior", "configuration", "requirement", "decision", "instruction", "rationale"] },
+            "kind": { "type": "string", "enum": ["behavior", "configuration", "requirement", "decision", "instruction", "rationale"] },
             "quote": { "type": "string", "description": "Exact text from the section that the claim rests on" },
             "illustrative": { "type": "boolean", "description": "True for examples, not facts about the project" }
           },
-          "required": ["text", "kind", "quote", "illustrative"]
+          "required": ["text", "kind", "quote", "illustrative"],
+          "additionalProperties": false
         }
       }
     },
-    "required": ["atoms"]
+    "required": ["claims"],
+    "additionalProperties": false
   }
 }
 ```
 
-**Pass 2, molecules and links:** one call over the atoms of the run's files.
+**Pass 2, compound claims and links:** one call over the claims of the run's files, each with an ID assigned by Distillery.
 
 ```json
 {
-  "name": "record_structure",
-  "description": "Group claims into molecules and record how claims relate.",
+  "name": "record_compounds",
+  "description": "Group claims into compound claims and record how claims relate.",
+  "strict": true,
   "input_schema": {
     "type": "object",
     "properties": {
-      "molecules": {
+      "compounds": {
         "type": "array",
         "items": {
           "type": "object",
           "properties": {
             "text": { "type": "string" },
-            "kind": { "enum": ["behavior", "configuration", "requirement", "decision", "instruction", "rationale"] },
-            "parts": { "type": "array", "items": { "type": "string" }, "description": "IDs of the claims this molecule is made of" }
+            "kind": { "type": "string", "enum": ["behavior", "configuration", "requirement", "decision", "instruction", "rationale"] },
+            "parts": { "type": "array", "items": { "type": "string" }, "description": "IDs of the claims this compound claim is made of" }
           },
-          "required": ["text", "kind", "parts"]
+          "required": ["text", "kind", "parts"],
+          "additionalProperties": false
         }
       },
       "links": {
@@ -139,18 +191,20 @@ Built first (M3), in two passes. The model must answer through tools, and Distil
           "properties": {
             "from": { "type": "string" },
             "to": { "type": "string" },
-            "relation": { "enum": ["depends_on", "supports", "opposes", "duplicates", "conflicts"] }
+            "relation": { "type": "string", "enum": ["depends_on", "supports", "opposes", "duplicates", "conflicts"] }
           },
-          "required": ["from", "to", "relation"]
+          "required": ["from", "to", "relation"],
+          "additionalProperties": false
         }
       }
     },
-    "required": ["molecules", "links"]
+    "required": ["compounds", "links"],
+    "additionalProperties": false
   }
 }
 ```
 
-**Claim kinds** (P6) draw on three existing frameworks:
+**Claim kinds** (P7), *Starting point*, draw on three existing frameworks:
 
 | Framework | What it contributes |
 |---|---|
@@ -160,41 +214,71 @@ Built first (M3), in two passes. The model must answer through tools, and Distil
 
 ## Runs and failures
 
-- **A run** is one commit, the files the user selected, the model and the prompt version (M8).
-- **Execution:** one run at a time, as a background task in the server. Progress is saved per section, and the run page polls for it.
-- **Provider errors** (timeouts, rate limits) are retried with backoff.
-- **Failed checks:** rejected claims go back to the model once with the reason. Sections that fail again are marked "not distilled," with the model's output shown.
-- **Long sections** are split at subheadings, then at paragraphs.
+- **Runs:** one commit, the selected files, the model and the prompt version (M8).
+- **Execution:** one run at a time, as plain synchronous code on its own thread. The command line (build step 4) and the server run the same code, and the run page reads the shared progress report. *Proposal*
+- **Provider errors:** 429, 5xx and 529 responses retried with backoff, honoring `retry-after`.
+- **Failed validation:** rejected claims go back to the model once with the reason. Sections failing again are marked "not distilled," with the model's output shown.
+- **Long sections:** split at subheadings, then at paragraphs.
 - **Incremental runs:** later runs add files at the same commit. Sections are cached by file blob hash, line range, prompt version and model, so unchanged sections are never re-sent.
+- **Prompt changes:** records from older prompt versions show as needing a re-run (I12).
 
 ## Model access
 
-- **`ModelProvider` trait** with the agent loop in Distillery (I3), and one adapter: the Anthropic Messages API (M13).
-- **Configuration:** API key from the `ANTHROPIC_API_KEY` environment variable; model name in the config file. *Proposal*
+- **`ModelProvider` trait** with the agent loop in Distillery (I3), and one adapter: the Anthropic Messages REST API, called through reqwest (M14, I10).
+- **Tool calls:** one forced tool per call, with `"strict": true`.
+- **API key:** only from the `ANTHROPIC_API_KEY` environment variable; never in the config file, the database or logs.
+
+## Configuration
+
+`distillery.example.toml` in the repo, copied to a git-ignored `distillery.toml`, laid out like lurkers' `lurker.example.toml` (I11):
+
+```toml
+# Distillery's settings. Copy this file to distillery.toml.
+
+[server]
+# Port on 127.0.0.1. The MVP has no login, so Distillery only serves locally.
+port = 8080
+
+[review]
+# Reviewer recorded on every decision made through this server.
+reviewer = "Rachel Fish"
+
+[model]
+# Anthropic model for new runs. Each run records its model.
+# The API key comes only from the ANTHROPIC_API_KEY environment variable.
+name = "claude-opus-5-5"
+
+[storage]
+# SQLite database, created when missing.
+database = "distillery.sqlite"
+# Folder for repository clones, one subfolder per repository, created when
+# missing. Repositories themselves are added through the web interface.
+clone_dir = "repos"
+```
 
 ## Stack
 
 | Part | Choice | Source |
 |---|---|---|
 | Language | Rust | I1 |
-| HTML | maud | M12 |
-| Web server | axum, with tokio | *Proposal* |
-| Browser scripts | Plain JavaScript for progress polling and keyboard review actions; no framework | *Proposal* |
-| Storage | rusqlite, schema versioned with SQLite's `user_version` | I6, *Proposal* for versioning |
+| Web server | axum, with tokio, on 127.0.0.1 | I9, M13 |
+| HTML | maud; plain HTML forms, no JavaScript | M13 |
+| Storage | rusqlite with bundled SQLite; schema steps tracked by `user_version`, as in web-of-trust | I6 |
 | Markdown | pulldown-cmark | I7 |
 | Git | Native git commands | I8 |
-| Anthropic API client | reqwest | *Proposal* |
+| Model API | reqwest | I10 |
+| Settings | TOML config file | I11 |
 
 ## Build order
 
 Each step is a small, isolated change that leaves a working program (M5).
 
 1. **Project setup:** Cargo binary, config file, SQLite schema for the data model.
-2. **Snapshot:** clone a repo URL, record the commit hash, list Markdown files.
+2. **Snapshot and progress:** clone a repo into the clone folder, record the commit hash, list Markdown files, with progress on the command line.
 3. **Sections:** split Markdown into sections with line ranges.
-4. **Atoms:** pass 1 with its quote check and cache, run from the command line on chosen files so the prompt can be tuned before any pages exist.
-5. **Runs page:** paste a repo URL, pick files, start a run, watch progress and failures.
-6. **Claims review:** each doc with its atoms beside the source lines; confirm, reject or edit, with a reason.
-7. **Molecules and links:** pass 2, with review of molecules, duplicates and conflicts. Decisions cite spans, and rejections flag dependent claims.
+4. **Atomic claims:** pass 1 with quote validation and its cache, run from the command line on chosen files, so the prompt can be tuned before any pages exist.
+5. **Runs page:** add a repo URL, pick files, start a run, and watch the same progress and failures as the command line.
+6. **Claims review:** each doc with its atomic claims beside the source lines; confirm, reject or edit, with a reason. AI proposals labeled (P4).
+7. **Compound claims and links:** pass 2, with review of compound claims, duplicates and conflicts. Decisions cite spans, and rejections flag dependent claims.
 8. **Distilled docs:** confirmed claims rendered as Markdown with references, plus PR commands.
-9. **Phrasing lint:** configurable rules that catch filler and AI phrasing in claim text (M2).
+9. **Phrasing lint:** configurable rules that catch filler and AI phrasing in claim text (M2, R9).
