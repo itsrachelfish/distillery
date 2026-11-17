@@ -13,6 +13,5 @@ v1 distills Markdown docs in git repos. Find stale, redundant, and conflicting c
 ```bash
 cp distillery.example.toml distillery.toml
 cargo run
+cargo run -- snapshot https://github.com/wetfish/server
 ```
-
-Prints settings in use and creates database. Tests: `cargo test`.

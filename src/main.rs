@@ -1,117 +1,141 @@
 mod config;
 mod db;
+mod git;
+mod progress;
+mod snapshot;
+#[cfg(test)]
+mod testing;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use clap::{Parser, Subcommand};
+
 use crate::config::Config;
+use crate::progress::{Progress, counted};
 
-/// The settings file read when none is given. `.gitignore` excludes it.
-const DEFAULT_CONFIG: &str = "distillery.toml";
+/// Distills docs into key facts, cited by source, confirmed by humans.
+///
+/// Without a command, prints the settings in use and creates or upgrades
+/// the database.
+#[derive(Debug, Parser)]
+#[command(name = "distillery", version)]
+struct Cli {
+    /// Settings file, laid out like distillery.example.toml
+    #[arg(
+        long,
+        global = true,
+        value_name = "FILE",
+        default_value = "distillery.toml"
+    )]
+    config: PathBuf,
 
-const USAGE: &str = "usage: distillery [CONFIG]
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
-Reads the settings in CONFIG, a TOML file laid out like
-distillery.example.toml, creates or upgrades the database, and prints the
-settings in use. CONFIG defaults to distillery.toml.";
-
-/// What the command line asks for.
-#[derive(Debug, PartialEq)]
-enum Args {
-    Run(PathBuf),
-    Help,
-    Version,
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Clone a repository, or fetch a known one, record its commit and list
+    /// its Markdown files
+    Snapshot {
+        /// An https or ssh URL, such as https://github.com/wetfish/server
+        url: String,
+    },
 }
 
 fn main() -> ExitCode {
-    let path = match parse_args(std::env::args().skip(1)) {
-        Ok(Args::Run(path)) => path,
-        Ok(Args::Help) => {
-            println!("{USAGE}");
-            return ExitCode::SUCCESS;
-        }
-        Ok(Args::Version) => {
-            println!("distillery {}", env!("CARGO_PKG_VERSION"));
-            return ExitCode::SUCCESS;
-        }
-        Err(err) => {
-            eprintln!("error: {err}\n\n{USAGE}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let config = match Config::load(&path) {
-        Ok(config) => config,
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {err}");
-            return ExitCode::FAILURE;
+            ExitCode::FAILURE
         }
-    };
-
-    let database = &config.storage.database;
-    let version = match db::open(database).and_then(|conn| db::schema_version(&conn)) {
-        Ok(version) => version,
-        Err(err) => {
-            eprintln!("error: opening {}: {err}", database.display());
-            return ExitCode::FAILURE;
-        }
-    };
-
-    println!("Settings: {}", path.display());
-    println!("Reviewer: {}", config.review.reviewer);
-    println!("Model: {}", config.model.name);
-    println!(
-        "Database: {} (schema version {version})",
-        database.display()
-    );
-    println!("Clone folder: {}", config.storage.clone_dir.display());
-    println!("Server port: {}", config.server.port);
-    ExitCode::SUCCESS
+    }
 }
 
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
-    let Some(first) = args.next() else {
-        return Ok(Args::Run(PathBuf::from(DEFAULT_CONFIG)));
-    };
-    if let Some(extra) = args.next() {
-        return Err(format!("unexpected argument '{extra}'"));
+fn run(cli: Cli) -> db::Result<()> {
+    let config = Config::load(&cli.config)?;
+    let database = &config.storage.database;
+    let conn =
+        db::open(database).map_err(|err| format!("opening {}: {err}", database.display()))?;
+
+    match cli.command {
+        None => {
+            println!("Settings: {}", cli.config.display());
+            println!("Reviewer: {}", config.review.reviewer);
+            println!("Model: {}", config.model.name);
+            println!(
+                "Database: {} (schema version {})",
+                database.display(),
+                db::schema_version(&conn)?
+            );
+            println!("Clone folder: {}", config.storage.clone_dir.display());
+            println!("Server port: {}", config.server.port);
+        }
+        Some(Command::Snapshot { url }) => {
+            let mut progress = Progress::to_stderr();
+            let found = snapshot::run(&conn, &config.storage.clone_dir, &url, &mut progress)?;
+            drop(progress);
+            println!("Clone: {}", found.clone.display());
+            println!(
+                "Commit: {} ({})",
+                found.commit,
+                if found.new_commit {
+                    "new"
+                } else {
+                    "already recorded"
+                }
+            );
+            println!(
+                "{}:",
+                counted(found.files.len() as u64, "Markdown file", "Markdown files")
+            );
+            for file in &found.files {
+                println!("{file}");
+            }
+        }
     }
-    match first.as_str() {
-        "-h" | "--help" => Ok(Args::Help),
-        "-V" | "--version" => Ok(Args::Version),
-        flag if flag.starts_with('-') => Err(format!("unknown option '{flag}'")),
-        _ => Ok(Args::Run(PathBuf::from(first))),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
-    fn parse(args: &[&str]) -> Result<Args, String> {
-        parse_args(args.iter().map(|arg| arg.to_string()))
+    #[test]
+    fn command_line_is_well_formed() {
+        Cli::command().debug_assert();
     }
 
     #[test]
     fn reads_the_default_settings_file() {
-        assert_eq!(parse(&[]), Ok(Args::Run(PathBuf::from("distillery.toml"))));
-        assert_eq!(
-            parse(&["other.toml"]),
-            Ok(Args::Run(PathBuf::from("other.toml")))
-        );
+        let cli = Cli::try_parse_from(["distillery"]).unwrap();
+        assert_eq!(cli.config, PathBuf::from("distillery.toml"));
+        assert!(cli.command.is_none());
     }
 
     #[test]
-    fn answers_help_and_version() {
-        assert_eq!(parse(&["-h"]), Ok(Args::Help));
-        assert_eq!(parse(&["--help"]), Ok(Args::Help));
-        assert_eq!(parse(&["-V"]), Ok(Args::Version));
-        assert_eq!(parse(&["--version"]), Ok(Args::Version));
+    fn takes_the_settings_file_before_or_after_the_command() {
+        let url = "https://github.com/wetfish/server";
+        for args in [
+            ["distillery", "--config", "other.toml", "snapshot", url],
+            ["distillery", "snapshot", url, "--config", "other.toml"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.config, PathBuf::from("other.toml"));
+            let Some(Command::Snapshot { url: parsed }) = cli.command else {
+                panic!("no snapshot command in {args:?}");
+            };
+            assert_eq!(parsed, url);
+        }
     }
 
     #[test]
-    fn rejects_unknown_options_and_extra_arguments() {
-        assert!(parse(&["--db"]).is_err());
-        assert!(parse(&["a.toml", "b.toml"]).is_err());
+    fn rejects_unknown_commands_and_missing_urls() {
+        assert!(Cli::try_parse_from(["distillery", "distill"]).is_err());
+        assert!(Cli::try_parse_from(["distillery", "snapshot"]).is_err());
     }
 }

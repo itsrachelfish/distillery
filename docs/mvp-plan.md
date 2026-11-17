@@ -59,7 +59,7 @@ Purple stages produce AI proposals (P4). Everything else is deterministic or don
 
 | Stage | What it does | Guarantee |
 |---|---|---|
-| Snapshot | `git clone` into the clone folder, `git rev-parse HEAD`, `git ls-files` for Markdown (I8) | Commit hash recorded on the run (M8) |
+| Snapshot | Bare `git clone` with full history into the clone folder, or `git fetch` for known repositories; `git rev-parse` for the commit; `git ls-tree` for `.md` and `.markdown` files (I8) | Commit hash recorded on the run (M8) |
 | Select files | Files picked in the web interface for this run (M8) | Cached sections skipped |
 | Atomic claims | Claims extracted from each section (M3, P5) | Each quote appears in its section word for word, ignoring whitespace differences |
 | Compound claims and links | Claims grouped into compound claims; related claims linked across all files distilled at the commit | Every part and link points to an existing claim |
@@ -77,7 +77,7 @@ The command line and the web interface show the same progress at every stage, so
 
 | Stage | Shown while running |
 |---|---|
-| Snapshot | git's clone progress: objects received, percentage |
+| Snapshot | git's own clone and fetch progress: objects received, percentage |
 | Select files | Markdown files found, files selected |
 | Sections | Sections per file, cached and to send |
 | Atomic claims | Section *n* of total, percentage, file and line range, attempt number, elapsed time of the current model call |
@@ -238,7 +238,7 @@ The MVP has no login (M13), so the server rejects every non-local request:
 
 - **Requests:** rejected unless the `Host` header is the server's own 127.0.0.1 or localhost address.
 - **Form posts:** rejected unless the `Origin` header is local too, so other websites can't record decisions under the reviewer's name.
-- **Clones:** repository URLs are passed to git after `--`, limited to https and ssh, with credential prompts turned off.
+- **Clones:** repository URLs are passed to git after `--`, limited to https and ssh, with credential prompts turned off. Clones are bare, so no checkout filters or hooks run.
 
 ## Configuration
 
@@ -280,6 +280,7 @@ clone_dir = "repos"
 | Git | Native git commands | I8 |
 | Model API | reqwest | I10 |
 | Settings | TOML config file, read with the toml and serde crates, as in lurkers | I11 |
+| Command line | clap derive, as in web-of-trust: `distillery snapshot URL`, with `--config FILE` for other settings files | |
 | Tests | Unit tests beside the code, as in web-of-trust and lurkers; a stub `ModelProvider` for model calls | |
 
 ## Build order
@@ -300,11 +301,17 @@ Each step is a small, isolated change that leaves a working program (M5), with t
 
 ## Proposed by Fable
 
-Choices no decision covers, awaiting sign-off (P4):
+Choices no decision covers (P4), with their sign-off status:
 
-| Build step | Choice | Reason |
+| Build step | Choice | Status |
 |---|---|---|
-| 1 | Command line: `distillery [CONFIG]`, parsed by hand, defaulting to `distillery.toml` | Same as lurkers; no clap until commands need it |
-| 1 | `review.reviewer` is the only required setting; the rest default to the values in `distillery.example.toml` | Decisions have no sensible default author |
-| 1 | Unknown settings are errors | Catches typos, repository lists and API keys in the config file |
-| 1 | `Cargo.lock` committed | Same as web-of-trust and lurkers |
+| 1 | `review.reviewer` is the only required setting; the rest default to the values in `distillery.example.toml` | Signed off |
+| 1 | Unknown settings are errors | Signed off |
+| 1 | `Cargo.lock` committed | Signed off |
+| 2 | Commands through clap derive, with `--config FILE` | Signed off |
+| 2 | Bare clones with full history; known repositories fetched | Signed off |
+| 2 | Clone folders named after the URL's host and path | Signed off |
+| 2 | `sources` and `revisions` tables; Markdown files listed from git on demand | Signed off |
+| 2 | Git's own progress output for clones and fetches | Signed off |
+| 2 | https URLs holding user names or tokens rejected, since URLs are stored | Signed off |
+| 2 | Symbolic links and submodules skipped when listing Markdown files | Signed off |

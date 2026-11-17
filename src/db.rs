@@ -9,7 +9,7 @@ use std::error::Error;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -18,7 +18,32 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema, as the steps that build it. Steps are only ever added at the
 /// end: released steps never change.
-const MIGRATIONS: [&str; 0] = [];
+const MIGRATIONS: [&str; 1] = [SCHEMA_V1];
+
+const SCHEMA_V1: &str = "
+-- Git repositories added by users.
+CREATE TABLE sources (
+    id INTEGER PRIMARY KEY,
+    -- The URL as first entered.
+    url TEXT NOT NULL,
+    -- The clone's path under the clone folder, such as
+    -- github.com/wetfish/server. Different URLs of one repository share it.
+    clone_folder TEXT NOT NULL UNIQUE,
+    -- UTC, as YYYY-MM-DD HH:MM:SS.
+    added_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Commits that snapshots found a source at.
+CREATE TABLE revisions (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources (id),
+    -- The full commit hash.
+    commit_hash TEXT NOT NULL,
+    -- UTC, as YYYY-MM-DD HH:MM:SS, when a snapshot first found it.
+    recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (source_id, commit_hash)
+);
+";
 
 /// Opens the database, creating it when the file is new and running the
 /// schema steps an older database is missing.
@@ -37,6 +62,31 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// How many schema steps the database has had.
 pub fn schema_version(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
+}
+
+/// The source cloned into `clone_folder`, added when it is new.
+pub fn source(conn: &Connection, url: &str, clone_folder: &str) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO sources (url, clone_folder) VALUES (?1, ?2)
+         ON CONFLICT (clone_folder) DO NOTHING",
+        params![url, clone_folder],
+    )?;
+    Ok(conn.query_row(
+        "SELECT id FROM sources WHERE clone_folder = ?1",
+        params![clone_folder],
+        |row| row.get(0),
+    )?)
+}
+
+/// Records that a source was found at a commit. Returns whether the commit
+/// is new for the source.
+pub fn record_revision(conn: &Connection, source_id: i64, commit_hash: &str) -> Result<bool> {
+    let added = conn.execute(
+        "INSERT INTO revisions (source_id, commit_hash) VALUES (?1, ?2)
+         ON CONFLICT (source_id, commit_hash) DO NOTHING",
+        params![source_id, commit_hash],
+    )?;
+    Ok(added > 0)
 }
 
 /// Runs the steps the database is missing, each in a transaction that also
@@ -64,37 +114,9 @@ fn migrate(conn: &Connection, steps: &[&str]) -> Result<()> {
 }
 
 #[cfg(test)]
-pub mod testing {
-    //! Temporary folders for tests that need files.
-
-    use std::fs;
-    use std::path::PathBuf;
-
-    /// A folder under the system's temporary folder, removed when dropped.
-    pub struct TempDir(pub PathBuf);
-
-    impl TempDir {
-        /// `name` must be unique among tests, which run in parallel.
-        pub fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("distillery-{name}-{}", std::process::id()));
-            let _ = fs::remove_dir_all(&path);
-            fs::create_dir_all(&path).unwrap();
-            TempDir(path)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::testing::TempDir;
     use super::*;
+    use crate::testing::TempDir;
 
     const STEP_1: &str = "CREATE TABLE first (id INTEGER PRIMARY KEY);";
     const STEP_2: &str = "CREATE TABLE second (
@@ -137,6 +159,40 @@ mod tests {
         drop(open(&path).unwrap());
         let conn = open(&path).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn adds_sources_once_per_clone_folder() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn, &MIGRATIONS).unwrap();
+        let folder = "github.com/wetfish/server";
+        let first = source(&conn, "https://github.com/wetfish/server", folder).unwrap();
+        let again = source(&conn, "git@github.com:wetfish/server.git", folder).unwrap();
+        assert_eq!(first, again);
+        let url: String = conn
+            .query_row("SELECT url FROM sources", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(url, "https://github.com/wetfish/server");
+
+        let other = source(
+            &conn,
+            "https://github.com/wetfish/wiki",
+            "github.com/wetfish/wiki",
+        );
+        assert_ne!(other.unwrap(), first);
+    }
+
+    #[test]
+    fn records_revisions_once_per_commit() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        migrate(&conn, &MIGRATIONS).unwrap();
+        let id = source(&conn, "https://example.net/a/b", "example.net/a/b").unwrap();
+        assert!(record_revision(&conn, id, "abc123").unwrap());
+        assert!(!record_revision(&conn, id, "abc123").unwrap());
+        assert!(record_revision(&conn, id, "def456").unwrap());
+        // Revisions belong to a source.
+        assert!(record_revision(&conn, id + 1, "abc123").is_err());
     }
 
     #[test]
