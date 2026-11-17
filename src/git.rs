@@ -162,6 +162,17 @@ pub fn markdown_files(
     Ok(files)
 }
 
+/// The contents of a file at `commit`. Bytes that are not UTF-8 show as
+/// replacement characters.
+pub fn file_at(clone: &Path, commit: &str, path: &str) -> Result<String, String> {
+    let mut command = git();
+    command.arg("--git-dir").arg(clone);
+    command.args(["cat-file", "blob"]);
+    command.arg(format!("{commit}:{path}"));
+    let contents = run_captured(command, "git cat-file")?;
+    Ok(String::from_utf8_lossy(&contents).into_owned())
+}
+
 /// Whether a path ends in `.md` or `.markdown`, in any letter case.
 fn is_markdown(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);

@@ -1,0 +1,92 @@
+//! The File page: a Markdown file at a recorded commit, as source text
+//! with line numbers. Claims cite source lines, so pages show the source
+//! and never render it as HTML.
+
+use axum::Router;
+use axum::extract::{Query, State};
+use axum::routing::get;
+use maud::{Markup, html};
+use serde::Deserialize;
+
+use super::sources::{self, Snapshot};
+use super::{App, Flash, PageError, PageResult, layout, with_db};
+use crate::git;
+use crate::progress::counted;
+
+pub(super) fn routes() -> Router<App> {
+    Router::new().route("/file", get(file_page))
+}
+
+#[derive(Deserialize)]
+struct FileQuery {
+    source: i64,
+    commit: String,
+    path: String,
+}
+
+/// The address of a file's page.
+pub(super) fn href(source_id: i64, commit: &str, path: &str) -> String {
+    format!(
+        "/file?source={source_id}&commit={commit}&path={}",
+        layout::url_encode(path)
+    )
+}
+
+async fn file_page(
+    State(app): State<App>,
+    Query(query): Query<FileQuery>,
+    Query(flash): Query<Flash>,
+) -> PageResult {
+    let clone_dir = app.clone_dir.clone();
+    with_db(&app, move |conn| {
+        let snapshot = sources::snapshot(conn, &clone_dir, query.source, Some(&query.commit))?;
+        // Only the Markdown files listed at the commit can be read, so the
+        // address can't name anything else in the repository.
+        if !snapshot.files.contains(&query.path) {
+            return Err(PageError::not_found(format!(
+                "{} is not a Markdown file at commit {}.",
+                query.path, snapshot.commit
+            )));
+        }
+        let contents = git::file_at(&snapshot.clone, &snapshot.commit, &query.path)
+            .map_err(PageError::internal)?;
+        Ok(layout::page(
+            &query.path,
+            &flash,
+            page(&snapshot, &query.path, &contents),
+        ))
+    })
+    .await
+}
+
+fn page(snapshot: &Snapshot, path: &str, contents: &str) -> Markup {
+    let source = &snapshot.source;
+    let lines: Vec<&str> = contents.lines().collect();
+    html! {
+        p.crumbs {
+            a href="/" { "Sources" }
+            " / "
+            a href=(sources::href(source.id, Some(&snapshot.commit))) { (source.clone_folder) }
+        }
+        h1 { (path) }
+        p.note {
+            "At commit " (layout::commit(&snapshot.commit)) ", "
+            (counted(lines.len() as u64, "line", "lines")) "."
+        }
+        @if lines.is_empty() {
+            p.empty { "This file is empty." }
+        } @else {
+            table.lines {
+                tbody {
+                    @for (index, line) in lines.iter().enumerate() {
+                        @let number = index + 1;
+                        tr id=(format!("L{number}")) {
+                            td.line-number { a href=(format!("#L{number}")) { (number) } }
+                            td.line-text { (line) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

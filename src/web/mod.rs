@@ -9,6 +9,7 @@
 //! The MVP has no login, so every request has to come from this computer's
 //! own pages: see `guard`.
 
+mod files;
 mod jobs;
 mod layout;
 mod sources;
@@ -51,6 +52,7 @@ pub fn run(config: &Config) -> db::Result<()> {
     let router = Router::new()
         .merge(sources::routes())
         .merge(jobs::routes())
+        .merge(files::routes())
         .route("/style.css", get(style))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(app.clone(), guard))

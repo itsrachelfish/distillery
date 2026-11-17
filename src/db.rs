@@ -9,7 +9,7 @@ use std::error::Error;
 use std::path::Path;
 use std::time::Duration;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 pub type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 
@@ -92,6 +92,7 @@ pub fn record_revision(conn: &Connection, source_id: i64, commit_hash: &str) -> 
 /// A source with its latest recorded commit, for the Sources page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceSummary {
+    pub id: i64,
     pub url: String,
     /// The clone's path under the clone folder, which names the source.
     pub clone_folder: String,
@@ -104,7 +105,7 @@ pub struct SourceSummary {
 /// Every source, by name.
 pub fn sources(conn: &Connection) -> Result<Vec<SourceSummary>> {
     let mut statement = conn.prepare(
-        "SELECT s.url, s.clone_folder, latest.commit_hash, latest.recorded_at,
+        "SELECT s.id, s.url, s.clone_folder, latest.commit_hash, latest.recorded_at,
                 (SELECT count(*) FROM revisions r WHERE r.source_id = s.id)
          FROM sources s
          LEFT JOIN revisions latest ON latest.id =
@@ -112,13 +113,63 @@ pub fn sources(conn: &Connection) -> Result<Vec<SourceSummary>> {
          ORDER BY s.clone_folder",
     )?;
     let rows = statement.query_map([], |row| {
-        let commit: Option<String> = row.get(2)?;
-        let recorded_at: Option<String> = row.get(3)?;
+        let commit: Option<String> = row.get(3)?;
+        let recorded_at: Option<String> = row.get(4)?;
         Ok(SourceSummary {
-            url: row.get(0)?,
-            clone_folder: row.get(1)?,
+            id: row.get(0)?,
+            url: row.get(1)?,
+            clone_folder: row.get(2)?,
             latest: commit.zip(recorded_at),
-            revisions: row.get(4)?,
+            revisions: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A git repository added by a user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub id: i64,
+    pub url: String,
+    /// The clone's path under the clone folder, which names the source.
+    pub clone_folder: String,
+}
+
+/// The source with this ID, if there is one.
+pub fn find_source(conn: &Connection, id: i64) -> Result<Option<Source>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, url, clone_folder FROM sources WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(Source {
+                    id: row.get(0)?,
+                    url: row.get(1)?,
+                    clone_folder: row.get(2)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// A commit that a snapshot found a source at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Revision {
+    /// The full commit hash.
+    pub commit_hash: String,
+    /// UTC, as YYYY-MM-DD HH:MM:SS.
+    pub recorded_at: String,
+}
+
+/// The commits recorded for a source, latest first.
+pub fn revisions(conn: &Connection, source_id: i64) -> Result<Vec<Revision>> {
+    let mut statement = conn.prepare(
+        "SELECT commit_hash, recorded_at FROM revisions WHERE source_id = ?1 ORDER BY id DESC",
+    )?;
+    let rows = statement.query_map(params![source_id], |row| {
+        Ok(Revision {
+            commit_hash: row.get(0)?,
+            recorded_at: row.get(1)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

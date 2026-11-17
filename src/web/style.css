@@ -218,3 +218,57 @@ progress {
     width: 100%;
     accent-color: var(--accent);
 }
+
+.crumbs {
+    margin: 0;
+    color: var(--muted);
+    font-size: 0.9rem;
+}
+
+ul.files {
+    margin: 0.5rem 0;
+    padding-left: 1.25rem;
+    font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    font-size: 0.9em;
+}
+
+/* A file's source text, one row per line. */
+table.lines {
+    border: 1px solid var(--border);
+    border-collapse: separate;
+    border-spacing: 0;
+    border-radius: 6px;
+    font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+    line-height: 1.5;
+}
+
+table.lines td {
+    height: 1.5em;
+    padding: 0 0.75rem;
+    border: 0;
+}
+
+td.line-number {
+    width: 1%;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    text-align: right;
+    white-space: nowrap;
+    user-select: none;
+}
+
+td.line-number a {
+    color: var(--muted);
+    text-decoration: none;
+}
+
+td.line-text {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+/* The line an address points to, such as #L12. */
+table.lines tr:target td {
+    background: var(--notice-background);
+}
