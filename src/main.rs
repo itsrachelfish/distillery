@@ -5,6 +5,7 @@ mod progress;
 mod snapshot;
 #[cfg(test)]
 mod testing;
+mod web;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -36,6 +37,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Serve the web interface on this computer only
+    Serve,
     /// Clone a repository, or fetch a known one, record its commit and list
     /// its Markdown files
     Snapshot {
@@ -73,6 +76,11 @@ fn run(cli: Cli) -> db::Result<()> {
             );
             println!("Clone folder: {}", config.storage.clone_dir.display());
             println!("Server port: {}", config.server.port);
+        }
+        Some(Command::Serve) => {
+            // Pages open the database themselves, one connection each.
+            drop(conn);
+            web::run(&config)?;
         }
         Some(Command::Snapshot { url }) => {
             let mut progress = Progress::to_stderr();

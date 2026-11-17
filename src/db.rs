@@ -89,6 +89,41 @@ pub fn record_revision(conn: &Connection, source_id: i64, commit_hash: &str) -> 
     Ok(added > 0)
 }
 
+/// A source with its latest recorded commit, for the Sources page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceSummary {
+    pub url: String,
+    /// The clone's path under the clone folder, which names the source.
+    pub clone_folder: String,
+    /// The commit of the latest snapshot, with when it was recorded in UTC.
+    pub latest: Option<(String, String)>,
+    /// How many commits snapshots have recorded.
+    pub revisions: i64,
+}
+
+/// Every source, by name.
+pub fn sources(conn: &Connection) -> Result<Vec<SourceSummary>> {
+    let mut statement = conn.prepare(
+        "SELECT s.url, s.clone_folder, latest.commit_hash, latest.recorded_at,
+                (SELECT count(*) FROM revisions r WHERE r.source_id = s.id)
+         FROM sources s
+         LEFT JOIN revisions latest ON latest.id =
+             (SELECT max(r.id) FROM revisions r WHERE r.source_id = s.id)
+         ORDER BY s.clone_folder",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let commit: Option<String> = row.get(2)?;
+        let recorded_at: Option<String> = row.get(3)?;
+        Ok(SourceSummary {
+            url: row.get(0)?,
+            clone_folder: row.get(1)?,
+            latest: commit.zip(recorded_at),
+            revisions: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Runs the steps the database is missing, each in a transaction that also
 /// records it, so a failed step leaves the database as it was.
 fn migrate(conn: &Connection, steps: &[&str]) -> Result<()> {
