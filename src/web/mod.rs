@@ -1,12 +1,15 @@
 //! `distillery serve`: the web interface, served on this computer only.
 //!
 //! Pages are built on the server with maud and use plain HTML forms, with no
-//! JavaScript. Each request opens the database on a blocking thread, since
-//! SQLite calls block.
+//! JavaScript. A form posts to an action, which redirects back to a page
+//! with a notice or an error in the address, so reloading a page never
+//! repeats an action. Each request opens the database on a blocking thread,
+//! since SQLite calls block.
 //!
 //! The MVP has no login, so every request has to come from this computer's
 //! own pages: see `guard`.
 
+mod jobs;
 mod layout;
 mod sources;
 
@@ -19,10 +22,11 @@ use axum::Router;
 use axum::extract::{Request, State};
 use axum::http::{Method, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use maud::{Markup, html};
 use rusqlite::Connection;
+use serde::Deserialize;
 
 use crate::config::Config;
 use crate::db;
@@ -32,6 +36,7 @@ const STYLE: &str = include_str!("style.css");
 #[derive(Clone)]
 struct App {
     db: Arc<PathBuf>,
+    clone_dir: Arc<PathBuf>,
     port: u16,
 }
 
@@ -40,10 +45,12 @@ pub fn run(config: &Config) -> db::Result<()> {
     let port = config.server.port;
     let app = App {
         db: Arc::new(config.storage.database.clone()),
+        clone_dir: Arc::new(config.storage.clone_dir.clone()),
         port,
     };
     let router = Router::new()
         .merge(sources::routes())
+        .merge(jobs::routes())
         .route("/style.css", get(style))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -158,7 +165,7 @@ impl IntoResponse for PageError {
             p.flash.error role="alert" { (self.message) }
             p { a href="/" { "Back to sources" } }
         };
-        (self.status, layout::page(title, body)).into_response()
+        (self.status, layout::page(title, &Flash::default(), body)).into_response()
     }
 }
 
@@ -183,6 +190,23 @@ where
 /// Turns a database error into an error page.
 fn internal(err: impl Display) -> PageError {
     PageError::internal(format!("reading the database: {err}"))
+}
+
+/// A notice or error carried in the address after an action, shown at the
+/// top of the page it redirected to.
+#[derive(Default, Deserialize)]
+struct Flash {
+    notice: Option<String>,
+    error: Option<String>,
+}
+
+/// Redirects to `back` with an error.
+fn failed(back: &str, error: impl Display) -> Redirect {
+    flash(back, "error", &error.to_string())
+}
+
+fn flash(back: &str, key: &str, message: &str) -> Redirect {
+    Redirect::to(&format!("{back}?{key}={}", layout::url_encode(message)))
 }
 
 async fn style() -> impl IntoResponse {

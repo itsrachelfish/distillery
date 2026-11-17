@@ -1,11 +1,11 @@
 //! The Sources page: every repository added, with its latest snapshot.
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::routing::get;
 use maud::{Markup, html};
 
-use super::{App, PageResult, internal, layout, with_db};
+use super::{App, Flash, PageResult, internal, layout, with_db};
 use crate::db::{self, SourceSummary};
 use crate::progress::counted;
 
@@ -13,10 +13,10 @@ pub(super) fn routes() -> Router<App> {
     Router::new().route("/", get(sources_page))
 }
 
-async fn sources_page(State(app): State<App>) -> PageResult {
-    with_db(&app, |conn| {
+async fn sources_page(State(app): State<App>, Query(flash): Query<Flash>) -> PageResult {
+    with_db(&app, move |conn| {
         let sources = db::sources(conn).map_err(internal)?;
-        Ok(layout::page("Sources", page(&sources)))
+        Ok(layout::page("Sources", &flash, page(&sources)))
     })
     .await
 }
@@ -28,11 +28,19 @@ fn page(sources: &[SourceSummary]) -> Markup {
             "Git repositories whose docs Distillery distills. Each snapshot records the commit "
             "of the default branch."
         }
+        form.inline method="post" action="/snapshot" {
+            label for="url" { "Repository URL" }
+            input type="text" id="url" name="url" required size="50"
+                placeholder="https://github.com/wetfish/server"
+                spellcheck="false" autocomplete="off";
+            button type="submit" { "Add source" }
+        }
+        p.note {
+            "An https or ssh URL. Distillery clones the repository with its full history and "
+            "records the commit of its default branch."
+        }
         @if sources.is_empty() {
-            p.empty {
-                "No sources yet. Add one from the command line: "
-                code { "distillery snapshot https://github.com/wetfish/server" }
-            }
+            p.empty { "No sources yet." }
         } @else {
             table {
                 thead {
@@ -41,6 +49,7 @@ fn page(sources: &[SourceSummary]) -> Markup {
                         th scope="col" { "Latest commit" }
                         th scope="col" { "Recorded" }
                         th.number scope="col" { "Commits" }
+                        th scope="col" { "Snapshot" }
                     }
                 }
                 tbody {
@@ -58,6 +67,12 @@ fn page(sources: &[SourceSummary]) -> Markup {
                                 td.note colspan="2" { "No snapshot yet" }
                             }
                             td.number { (source.revisions) }
+                            td {
+                                form method="post" action="/snapshot" {
+                                    input type="hidden" name="url" value=(source.url);
+                                    button type="submit" { "Fetch latest" }
+                                }
+                            }
                         }
                     }
                 }

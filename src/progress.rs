@@ -2,15 +2,51 @@
 //! stuck. In a terminal, one line is redrawn in place a few times a second;
 //! otherwise, such as when output goes to a file, a line is printed every few
 //! seconds. Each stage ends with a line saying what it did and how long it
-//! took. Modeled on web-of-trust's `progress.rs`.
+//! took. The same can be kept in a shared report, for the web interface to
+//! show while a job runs on another thread. Modeled on web-of-trust's
+//! `progress.rs`.
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// How often the line is redrawn in a terminal.
 const TERMINAL_INTERVAL: Duration = Duration::from_millis(200);
 /// How often a line is printed when standard error is not a terminal.
 const LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// How often a shared report is brought up to date.
+const SHARED_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Progress as another thread reads it: the stages that ended, the one
+/// under way, and the notes in between.
+#[derive(Clone, Debug, Default)]
+pub struct Report {
+    pub done: Vec<Done>,
+    pub current: Option<Current>,
+    /// Lines outside any stage.
+    pub notes: Vec<String>,
+}
+
+pub type SharedReport = Arc<Mutex<Report>>;
+
+/// A stage that ended: what it was, what it did and how long it took.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Done {
+    pub label: String,
+    pub summary: String,
+    pub took: String,
+}
+
+/// The stage under way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Current {
+    pub label: String,
+    /// How far it has come out of `total`, or with no total when 0.
+    pub done: u64,
+    pub total: u64,
+    /// The line a terminal shows, such as `Listing files: 25% (...)`.
+    pub line: String,
+}
 
 struct Stage {
     label: String,
@@ -20,6 +56,8 @@ struct Stage {
     started: Instant,
     /// When the line was last shown.
     shown: Option<Instant>,
+    /// When the shared report last got the line.
+    shared: Option<Instant>,
 }
 
 /// Reports stages of work and their progress.
@@ -30,6 +68,8 @@ pub struct Progress {
     stage: Option<Stage>,
     /// Whether a redrawn line is on screen and has to be cleared.
     drawn: bool,
+    /// A report kept up to date for another thread.
+    shared: Option<SharedReport>,
 }
 
 impl Progress {
@@ -40,6 +80,21 @@ impl Progress {
             terminal: io::stderr().is_terminal(),
             stage: None,
             drawn: false,
+            shared: None,
+        }
+    }
+
+    /// Reports on standard error, and in `report` for another thread to show.
+    pub fn to_stderr_and(report: SharedReport) -> Self {
+        let mut progress = Progress::to_stderr();
+        progress.shared = Some(report);
+        progress
+    }
+
+    /// Changes the shared report, if there is one.
+    fn share(&self, change: impl FnOnce(&mut Report)) {
+        if let Some(shared) = &self.shared {
+            change(&mut shared.lock().unwrap_or_else(PoisonError::into_inner));
         }
     }
 
@@ -51,6 +106,7 @@ impl Progress {
             terminal: false,
             stage: None,
             drawn: false,
+            shared: None,
         }
     }
 
@@ -63,6 +119,15 @@ impl Progress {
             unit,
             started: Instant::now(),
             shown: None,
+            shared: None,
+        });
+        self.share(|report| {
+            report.current = Some(Current {
+                label: label.to_string(),
+                done: 0,
+                total,
+                line: format!("{label}..."),
+            });
         });
         if !self.enabled {
             return;
@@ -83,9 +148,27 @@ impl Progress {
     /// and is only built when the line is shown, so calling this often costs
     /// little.
     pub fn update(&mut self, done: u64, detail: impl FnOnce() -> String) {
-        if !self.enabled {
-            return;
-        }
+        self.show(done, |stage, now| {
+            progress_line(stage, done, &detail(), now)
+        });
+    }
+
+    /// Reports the stage's progress in words from elsewhere, such as git's
+    /// own progress line for a clone.
+    pub fn status(&mut self, text: &str) {
+        self.show(0, |stage, now| {
+            format!(
+                "{}: {text}, {}",
+                stage.label,
+                elapsed(now.duration_since(stage.started))
+            )
+        });
+    }
+
+    /// Shows the stage's line where it is due: on standard error, in the
+    /// shared report, or neither when both were brought up to date a moment
+    /// ago.
+    fn show(&mut self, done: u64, line: impl FnOnce(&Stage, Instant) -> String) {
         let Some(stage) = self.stage.as_mut() else {
             return;
         };
@@ -96,21 +179,40 @@ impl Progress {
             LOG_INTERVAL
         };
         // The first line waits a moment, so quick stages stay quiet.
-        let since = stage.shown.unwrap_or(stage.started);
-        if now.duration_since(since) < interval {
+        let print =
+            self.enabled && now.duration_since(stage.shown.unwrap_or(stage.started)) >= interval;
+        let share = self.shared.is_some()
+            && now.duration_since(stage.shared.unwrap_or(stage.started)) >= SHARED_INTERVAL;
+        if !print && !share {
             return;
         }
-        stage.shown = Some(now);
-        let line = progress_line(stage, done, &detail(), now);
-        let mut err = io::stderr().lock();
-        if self.terminal {
-            // Back to the start of the line, and clear it.
-            let _ = write!(err, "\r\x1b[2K{line}");
-            self.drawn = true;
-        } else {
-            let _ = writeln!(err, "{line}");
+        let line = line(stage, now);
+        if share {
+            stage.shared = Some(now);
         }
-        let _ = err.flush();
+        if print {
+            stage.shown = Some(now);
+            let mut err = io::stderr().lock();
+            if self.terminal {
+                // Back to the start of the line, and clear it.
+                let _ = write!(err, "\r\x1b[2K{line}");
+                self.drawn = true;
+            } else {
+                let _ = writeln!(err, "{line}");
+            }
+            let _ = err.flush();
+        }
+        if share {
+            let (label, total) = (stage.label.clone(), stage.total);
+            self.share(|report| {
+                report.current = Some(Current {
+                    label,
+                    done,
+                    total,
+                    line,
+                });
+            });
+        }
     }
 
     /// Ends the stage with what it did, and how long it took.
@@ -119,13 +221,18 @@ impl Progress {
         let Some(stage) = self.stage.take() else {
             return;
         };
+        let took = elapsed(stage.started.elapsed());
         if self.enabled {
-            eprintln!(
-                "{}: {summary} ({})",
-                stage.label,
-                elapsed(stage.started.elapsed())
-            );
+            eprintln!("{}: {summary} ({took})", stage.label);
         }
+        self.share(|report| {
+            report.current = None;
+            report.done.push(Done {
+                label: stage.label,
+                summary: summary.to_string(),
+                took,
+            });
+        });
     }
 
     /// Prints a line of its own, outside any stage's progress.
@@ -134,6 +241,7 @@ impl Progress {
         if self.enabled {
             eprintln!("{message}");
         }
+        self.share(|report| report.notes.push(message.to_string()));
     }
 
     /// Removes a redrawn line from the terminal.
@@ -236,6 +344,7 @@ mod tests {
             unit: "files",
             started,
             shown: None,
+            shared: None,
         };
         let line = progress_line(&stage(4_000), 1_000, "docs/a.md", started);
         assert_eq!(

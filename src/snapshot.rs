@@ -41,13 +41,17 @@ fn snapshot(
     progress: &mut Progress,
 ) -> db::Result<Snapshot> {
     let clone = clone_dir.join(&repo.folder);
-    // Git shows its own progress for clones and fetches.
+    // Clones and fetches show git's own progress lines.
     if git::is_cloned(&clone) {
         progress.note(&format!("Fetching into {}", clone.display()));
-        git::fetch(&clone)?;
+        progress.stage("Fetching", 0, "");
+        git::fetch(&clone, &mut |line| progress.status(line))?;
+        progress.done("up to date with the remote");
     } else {
         progress.note(&format!("Cloning {} into {}", repo.url, clone.display()));
-        git::clone(&repo.url, &clone)?;
+        progress.stage("Cloning", 0, "");
+        git::clone(&repo.url, &clone, &mut |line| progress.status(line))?;
+        progress.done("cloned with full history");
     }
     let commit = git::head(&clone)?;
 

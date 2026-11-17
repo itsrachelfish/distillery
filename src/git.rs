@@ -6,7 +6,7 @@
 //! needs for the age of each file.
 
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -90,28 +90,27 @@ pub fn is_cloned(clone: &Path) -> bool {
     clone.join("HEAD").is_file()
 }
 
-/// Clones `url` into `clone` as a bare repository. Git reports its own
-/// progress on standard error.
-pub fn clone(url: &str, clone: &Path) -> Result<(), String> {
+/// Clones `url` into `clone` as a bare repository. `on_line` gets each line
+/// of git's own progress, as git wrote it.
+pub fn clone(url: &str, clone: &Path, on_line: &mut dyn FnMut(&str)) -> Result<(), String> {
     if let Some(parent) = clone.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("creating {}: {err}", parent.display()))?;
     }
     let mut command = git();
-    command.args(["clone", "--bare"]);
-    command.arg(progress_flag());
+    command.args(["clone", "--bare", "--progress"]);
     command.arg("--").arg(url).arg(clone);
-    run_shown(command, "git clone")
+    run_reported(command, "git clone", on_line)
 }
 
 /// Brings every branch of a bare clone up to date with its remote.
-pub fn fetch(clone: &Path) -> Result<(), String> {
+/// `on_line` gets each line of git's own progress.
+pub fn fetch(clone: &Path, on_line: &mut dyn FnMut(&str)) -> Result<(), String> {
     let mut command = git();
     command.arg("--git-dir").arg(clone);
-    command.args(["fetch", "--prune"]);
-    command.arg(progress_flag());
+    command.args(["fetch", "--prune", "--progress"]);
     command.args(["origin", "+refs/heads/*:refs/heads/*"]);
-    run_shown(command, "git fetch")
+    run_reported(command, "git fetch", on_line)
 }
 
 /// The commit hash the clone's default branch points to.
@@ -179,26 +178,69 @@ fn git() -> Command {
     command
 }
 
-/// Git's progress display in a terminal, and quiet output elsewhere, such as
-/// when standard error goes to a file.
-fn progress_flag() -> &'static str {
-    if io::stderr().is_terminal() {
-        "--progress"
-    } else {
-        "--quiet"
-    }
-}
+/// How many of git's last messages an error quotes.
+const ERROR_LINES: usize = 3;
 
-/// Runs a command whose progress and errors git shows itself.
-fn run_shown(mut command: Command, name: &str) -> Result<(), String> {
-    let status = command
+/// Runs a command that reports progress on standard error, passing each
+/// line to `on_line`. Git redraws a progress line by ending it with a
+/// carriage return, so both line endings count.
+fn run_reported(
+    mut command: Command,
+    name: &str,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let mut child = command
         .stdout(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|err| format!("running {name}: {err}. Is git installed?"))?;
+    let mut stderr = child.stderr.take().expect("standard error is piped");
+
+    // Lines that stayed on screen, which is where git's errors are.
+    let mut messages: Vec<String> = Vec::new();
+    let mut line = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        let read = match stderr.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        for &byte in &buffer[..read] {
+            if byte != b'\r' && byte != b'\n' {
+                line.push(byte);
+                continue;
+            }
+            let text = String::from_utf8_lossy(&line).trim().to_owned();
+            line.clear();
+            if text.is_empty() {
+                continue;
+            }
+            on_line(&text);
+            if byte == b'\n' {
+                messages.push(text);
+            }
+        }
+    }
+    let last = String::from_utf8_lossy(&line).trim().to_owned();
+    if !last.is_empty() {
+        on_line(&last);
+        messages.push(last);
+    }
+
+    let status = child
+        .wait()
+        .map_err(|err| format!("waiting for {name}: {err}"))?;
     if status.success() {
-        Ok(())
+        return Ok(());
+    }
+    let from = messages.len().saturating_sub(ERROR_LINES);
+    let said = messages[from..].join(" ");
+    if said.is_empty() {
+        Err(format!("{name} failed without a message"))
     } else {
-        Err(format!("{name} failed; git's message is above"))
+        Err(format!("{name} failed: {said}"))
     }
 }
 
@@ -318,7 +360,7 @@ mod tests {
 
         let clone_path = root.0.join("clones/host/repo");
         assert!(!is_cloned(&clone_path));
-        clone(origin.to_str().unwrap(), &clone_path).unwrap();
+        clone(origin.to_str().unwrap(), &clone_path, &mut |_| ()).unwrap();
         assert!(is_cloned(&clone_path));
         assert!(!clone_path.join("README.md").exists(), "clones are bare");
         assert_eq!(head(&clone_path).unwrap(), first);
@@ -334,7 +376,7 @@ mod tests {
         // A fetch moves the default branch, and the first commit still reads
         // the same.
         let second = testing::commit(&origin, &[("docs/c.md", "# C\n")]);
-        fetch(&clone_path).unwrap();
+        fetch(&clone_path, &mut |_| ()).unwrap();
         assert_eq!(head(&clone_path).unwrap(), second);
         assert_eq!(
             markdown_files(&clone_path, &second, |_, _| ())
@@ -374,7 +416,7 @@ mod tests {
         let commit = testing::git(&origin, &["rev-parse", "HEAD"]);
 
         let clone_path = root.0.join("clone");
-        clone(origin.to_str().unwrap(), &clone_path).unwrap();
+        clone(origin.to_str().unwrap(), &clone_path, &mut |_| ()).unwrap();
         let files = markdown_files(&clone_path, &commit, |_, _| ()).unwrap();
         assert_eq!(files, ["README.md"]);
     }
@@ -386,7 +428,7 @@ mod tests {
         std::fs::create_dir_all(&origin).unwrap();
         testing::git(&origin, &["init", "--quiet", "--initial-branch=main"]);
         let clone_path = root.0.join("clone");
-        clone(origin.to_str().unwrap(), &clone_path).unwrap();
+        clone(origin.to_str().unwrap(), &clone_path, &mut |_| ()).unwrap();
         let err = head(&clone_path).unwrap_err();
         assert!(err.contains("no commits"), "{err}");
     }
