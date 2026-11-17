@@ -1,0 +1,10 @@
+/target
+
+# Local settings, copied from distillery.example.toml
+/distillery.toml
+
+# The default database, and SQLite's temporary files next to it
+/distillery.sqlite*
+
+# The default clone folder
+/repos/

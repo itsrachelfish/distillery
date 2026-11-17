@@ -7,3 +7,12 @@ v1 distills Markdown docs in git repos. Find stale, redundant, and conflicting c
 - [docs/decisions.md](docs/decisions.md): current decisions, cited
 - [docs/mvp-plan.md](docs/mvp-plan.md): MVP development plan
 - [transcripts/](transcripts/): prompts & transcripts
+
+## Setup
+
+```bash
+cp distillery.example.toml distillery.toml
+cargo run
+```
+
+Prints settings in use and creates database. Tests: `cargo test`.

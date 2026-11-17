@@ -18,7 +18,7 @@ How the MVP gets built. Numbers such as M3 refer to [decisions.md](decisions.md)
 | Atomic claim | Claim quoting one span |
 | Compound claim | Claim made of other claims |
 | Link | Relation between two claims |
-| Finding | Duplicate, conflicting or stale claims |
+| Finding | Duplicate or conflicting claims |
 | Decision | Ruling by a person on claims or findings, with a reason and cited spans |
 | Party | Author of a record: person, team, vendor or AI agent |
 | AI proposal | Record written by an AI agent, not yet confirmed by a person |
@@ -34,6 +34,7 @@ How the MVP gets built. Numbers such as M3 refer to [decisions.md](decisions.md)
 | Progress at every stage, on the command line and the web (M9) | An ORM, chosen once the data model settles (I6) |
 | Anthropic REST API behind a platform-agnostic trait (M14) | Graph and diagram views (R2) |
 | Server-rendered pages on localhost, without JavaScript (M13) | CI integration (L8) |
+| Stale claims and needless detail, as review outcomes | Staleness detection, which needs code checks (L2) |
 
 ## Stages
 
@@ -60,9 +61,9 @@ Purple stages produce AI proposals (P4). Everything else is deterministic or don
 |---|---|---|
 | Snapshot | `git clone` into the clone folder, `git rev-parse HEAD`, `git ls-files` for Markdown (I8) | Commit hash recorded on the run (M8) |
 | Select files | Files picked in the web interface for this run (M8) | Cached sections skipped |
-| Atomic claims | Claims extracted from each section (M3, P5) | Each quote appears in its section word for word |
-| Compound claims and links | Claims grouped into compound claims; related claims linked across the run's files | Every part and link points to an existing claim |
-| Review | People confirm, reject, edit or pick a side, with a reason (P3) | Decisions cite spans |
+| Atomic claims | Claims extracted from each section (M3, P5) | Each quote appears in its section word for word, ignoring whitespace differences |
+| Compound claims and links | Claims grouped into compound claims; related claims linked across all files distilled at the commit | Every part and link points to an existing claim |
+| Review | People confirm, reject, edit or pick a side (P3). Rejections, edits and picked sides need a reason; confirmations can omit it | Decisions cite spans |
 | Distilled docs | Confirmed claims rendered with references, plus PR commands (M11) | Every claim kept, merged or rejected |
 
 ## Progress
@@ -98,7 +99,7 @@ flowchart TD
     span["Span<br/>Exact quote and lines"]
     run["Run<br/>Files, model, prompt version"]
     claim["Claim<br/>Atomic or compound"]
-    finding["Finding<br/>Duplicate, conflict, stale"]
+    finding["Finding<br/>Duplicate, conflict"]
     decision["Decision<br/>Who, why, scope"]
     party -->|owns| source
     source -->|has| revision
@@ -125,12 +126,14 @@ flowchart TD
 - **Reviewer:** decisions made through the server are recorded as the reviewer in the config file (P3).
 - **Rejections flow upward:** rejected claims flag every claim that depends on them. Decisions whose support never reaches a person's confirmation are flagged as unconfirmed assumptions (C5).
 - **Decisions** are never edited. Changes are new decisions that supersede the old ones (P3).
+- **Stale claims and needless detail** are review outcomes: rejected claims and losing sides of conflicts. Conflict review shows the last commit date of each file.
+- **Schema:** each build step adds the tables it needs as a new schema step. No table exists before the code that uses it.
 
 ## Claim extraction
 
-Built first (M3), in two passes. Every call forces one tool with strict tool use, so replies always match the schema, and validation checks the content. Prompts and tool schemas are files tracked in git; the prompt version is their hash (I12).
+Built first (M3), in two passes. Every call forces one tool with strict tool use, so complete replies match the schema, and validation checks the content. Replies cut off at the token limit and refusals are outside that guarantee: the stop reason is checked first, and both count as failed sections. Prompts and tool schemas are files tracked in git; the prompt version is their hash (I12).
 
-**Pass 1, atomic claims:** one call per section. Tables, lists and code blocks are sent as written, with their line numbers. No format is assumed (P6).
+**Pass 1, atomic claims:** one call per section. Tables, lists and code blocks are sent as written. No format is assumed (P6). Distillery finds each quote in its section, ignoring whitespace differences, and derives the span's line range.
 
 ```json
 {
@@ -161,7 +164,7 @@ Built first (M3), in two passes. Every call forces one tool with strict tool use
 }
 ```
 
-**Pass 2, compound claims and links:** one call over the claims of the run's files, each with an ID assigned by Distillery.
+**Pass 2, compound claims and links:** one call over all claims at the run's commit that aren't rejected, including claims from earlier runs, each with an ID assigned by Distillery.
 
 ```json
 {
@@ -215,8 +218,9 @@ Built first (M3), in two passes. Every call forces one tool with strict tool use
 ## Runs and failures
 
 - **Runs:** one commit, the selected files, the model and the prompt version (M8).
-- **Execution:** one run at a time, as plain synchronous code on its own thread. The command line (build step 4) and the server run the same code, and the run page reads the shared progress report. *Proposal*
+- **Execution:** one run at a time, as plain synchronous code on its own thread. The command line (build step 4) and the server run the same code, and the run page reads the shared progress report. Processing files in parallel, such as one process per docs file for whole repos, comes later where it shortens runs.
 - **Provider errors:** 429, 5xx and 529 responses retried with backoff, honoring `retry-after`.
+- **Incomplete replies:** replies cut off at the token limit split the section and retry. Refusals mark the section "not distilled."
 - **Failed validation:** rejected claims go back to the model once with the reason. Sections failing again are marked "not distilled," with the model's output shown.
 - **Long sections:** split at subheadings, then at paragraphs.
 - **Incremental runs:** later runs add files at the same commit. Sections are cached by file blob hash, line range, prompt version and model, so unchanged sections are never re-sent.
@@ -227,6 +231,14 @@ Built first (M3), in two passes. Every call forces one tool with strict tool use
 - **`ModelProvider` trait** with the agent loop in Distillery (I3), and one adapter: the Anthropic Messages REST API, called through reqwest (M14, I10).
 - **Tool calls:** one forced tool per call, with `"strict": true`.
 - **API key:** only from the `ANTHROPIC_API_KEY` environment variable; never in the config file, the database or logs.
+
+## Local requests only
+
+The MVP has no login (M13), so the server rejects every non-local request:
+
+- **Requests:** rejected unless the `Host` header is the server's own 127.0.0.1 or localhost address.
+- **Form posts:** rejected unless the `Origin` header is local too, so other websites can't record decisions under the reviewer's name.
+- **Clones:** repository URLs are passed to git after `--`, limited to https and ssh, with credential prompts turned off.
 
 ## Configuration
 
@@ -267,18 +279,32 @@ clone_dir = "repos"
 | Markdown | pulldown-cmark | I7 |
 | Git | Native git commands | I8 |
 | Model API | reqwest | I10 |
-| Settings | TOML config file | I11 |
+| Settings | TOML config file, read with the toml and serde crates, as in lurkers | I11 |
+| Tests | Unit tests beside the code, as in web-of-trust and lurkers; a stub `ModelProvider` for model calls | |
 
 ## Build order
 
-Each step is a small, isolated change that leaves a working program (M5).
+Each step is a small, isolated change that leaves a working program (M5), with tests for the developer to run.
 
-1. **Project setup:** Cargo binary, config file, SQLite schema for the data model.
+1. **Project setup:** Cargo binary, config file, and a database with versioned schema steps.
 2. **Snapshot and progress:** clone a repo into the clone folder, record the commit hash, list Markdown files, with progress on the command line.
 3. **Sections:** split Markdown into sections with line ranges.
 4. **Atomic claims:** pass 1 with quote validation and its cache, run from the command line on chosen files, so the prompt can be tuned before any pages exist.
 5. **Runs page:** add a repo URL, pick files, start a run, and watch the same progress and failures as the command line.
 6. **Claims review:** each doc with its atomic claims beside the source lines; confirm, reject or edit, with a reason. AI proposals labeled (P4).
-7. **Compound claims and links:** pass 2, with review of compound claims, duplicates and conflicts. Decisions cite spans, and rejections flag dependent claims.
+7. **Compound claims and links,** in two commits:
+   - Pass 2 from the command line, so the prompt can be tuned before its pages exist.
+   - Review of compound claims, duplicates and conflicts. Decisions cite spans, and rejections flag dependent claims.
 8. **Distilled docs:** confirmed claims rendered as Markdown with references, plus PR commands.
 9. **Phrasing lint:** configurable rules that catch filler and AI phrasing in claim text (M2, R9).
+
+## Proposed by Fable
+
+Choices no decision covers, awaiting sign-off (P4):
+
+| Build step | Choice | Reason |
+|---|---|---|
+| 1 | Command line: `distillery [CONFIG]`, parsed by hand, defaulting to `distillery.toml` | Same as lurkers; no clap until commands need it |
+| 1 | `review.reviewer` is the only required setting; the rest default to the values in `distillery.example.toml` | Decisions have no sensible default author |
+| 1 | Unknown settings are errors | Catches typos, repository lists and API keys in the config file |
+| 1 | `Cargo.lock` committed | Same as web-of-trust and lurkers |

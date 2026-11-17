@@ -1,0 +1,21 @@
+# Distillery's settings. Copy this file to distillery.toml.
+
+[server]
+# Port on 127.0.0.1. The MVP has no login, so Distillery only serves locally.
+port = 8080
+
+[review]
+# Reviewer recorded on every decision made through this server.
+reviewer = "Rachel Fish"
+
+[model]
+# Anthropic model for new runs. Each run records its model.
+# The API key comes only from the ANTHROPIC_API_KEY environment variable.
+name = "claude-opus-5-5"
+
+[storage]
+# SQLite database, created when missing.
+database = "distillery.sqlite"
+# Folder for repository clones, one subfolder per repository, created when
+# missing. Repositories themselves are added through the web interface.
+clone_dir = "repos"
