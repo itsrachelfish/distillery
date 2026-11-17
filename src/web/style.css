@@ -272,3 +272,18 @@ td.line-text {
 table.lines tr:target td {
     background: var(--notice-background);
 }
+
+/* The row above a section's first line. */
+table.lines tr.section-start td {
+    height: auto;
+    padding: 0.3rem 0.75rem;
+    background: var(--notice-background);
+    border-top: 1px solid var(--border);
+    border-bottom: 1px solid var(--border);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 0.85rem;
+}
+
+table.lines tr.section-start:first-child td {
+    border-top: 0;
+}

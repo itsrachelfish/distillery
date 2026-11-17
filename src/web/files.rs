@@ -1,6 +1,6 @@
 //! The File page: a Markdown file at a recorded commit, as source text
-//! with line numbers. Claims cite source lines, so pages show the source
-//! and never render it as HTML.
+//! with line numbers, cut into its sections. Claims cite source lines, so
+//! pages show the source and never render it as HTML.
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -8,10 +8,11 @@ use axum::routing::get;
 use maud::{Markup, html};
 use serde::Deserialize;
 
-use super::sources::{self, Snapshot};
+use super::sources::{self as source_pages, Snapshot};
 use super::{App, Flash, PageError, PageResult, layout, with_db};
 use crate::git;
 use crate::progress::counted;
+use crate::sections;
 
 pub(super) fn routes() -> Router<App> {
     Router::new().route("/file", get(file_page))
@@ -39,7 +40,7 @@ async fn file_page(
 ) -> PageResult {
     let clone_dir = app.clone_dir.clone();
     with_db(&app, move |conn| {
-        let snapshot = sources::snapshot(conn, &clone_dir, query.source, Some(&query.commit))?;
+        let snapshot = source_pages::snapshot(conn, &clone_dir, query.source, Some(&query.commit))?;
         // Only the Markdown files listed at the commit can be read, so the
         // address can't name anything else in the repository.
         if !snapshot.files.contains(&query.path) {
@@ -62,16 +63,31 @@ async fn file_page(
 fn page(snapshot: &Snapshot, path: &str, contents: &str) -> Markup {
     let source = &snapshot.source;
     let lines: Vec<&str> = contents.lines().collect();
+    let sections = sections::split(contents);
+    // The section starting at each line, by its number among the sections.
+    let starts = |line: usize| {
+        sections
+            .iter()
+            .enumerate()
+            .find(|(_, section)| section.start_line == line)
+    };
     html! {
         p.crumbs {
             a href="/" { "Sources" }
             " / "
-            a href=(sources::href(source.id, Some(&snapshot.commit))) { (source.clone_folder) }
+            a href=(source_pages::href(source.id, Some(&snapshot.commit))) {
+                (source.clone_folder)
+            }
         }
         h1 { (path) }
         p.note {
             "At commit " (layout::commit(&snapshot.commit)) ", "
-            (counted(lines.len() as u64, "line", "lines")) "."
+            (counted(lines.len() as u64, "line", "lines")) " in "
+            (counted(sections.len() as u64, "section", "sections")) "."
+        }
+        p.note {
+            "Sections run from one heading to the next. Each is sent to the model on its own, "
+            "with the headings above it as context."
         }
         @if lines.is_empty() {
             p.empty { "This file is empty." }
@@ -80,6 +96,15 @@ fn page(snapshot: &Snapshot, path: &str, contents: &str) -> Markup {
                 tbody {
                     @for (index, line) in lines.iter().enumerate() {
                         @let number = index + 1;
+                        @if let Some((position, section)) = starts(number) {
+                            tr.section-start id=(format!("S{}", position + 1)) {
+                                td colspan="2" {
+                                    strong { "Section " (position + 1) }
+                                    " · lines " (section.start_line) "–" (section.end_line)
+                                    " · " (section.title())
+                                }
+                            }
+                        }
                         tr id=(format!("L{number}")) {
                             td.line-number { a href=(format!("#L{number}")) { (number) } }
                             td.line-text { (line) }

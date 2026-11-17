@@ -2,6 +2,7 @@ mod config;
 mod db;
 mod git;
 mod progress;
+mod sections;
 mod snapshot;
 #[cfg(test)]
 mod testing;

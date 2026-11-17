@@ -10,6 +10,7 @@ repository = "https://github.com/itsrachelfish/distillery"
 axum = "0.8.9"
 clap = { version = "4.6", features = ["derive"] }
 maud = { version = "0.27", features = ["axum"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 rusqlite = { version = "0.41", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 tokio = { version = "1.54", features = ["rt", "net"] }
