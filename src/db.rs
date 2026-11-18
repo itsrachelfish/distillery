@@ -18,8 +18,8 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema, as the steps that build it. Steps are only ever added at the
 /// end: released steps never change.
-const MIGRATIONS: [&str; 6] = [
-    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+const MIGRATIONS: [&str; 7] = [
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
 ];
 
 const SCHEMA_V1: &str = "
@@ -235,6 +235,66 @@ const SCHEMA_V6: &str = "
 -- places, supplied by Distillery and not by the model.
 ALTER TABLE spans ADD COLUMN start_column INTEGER;
 ALTER TABLE spans ADD COLUMN end_column INTEGER;
+";
+
+const SCHEMA_V7: &str = "
+-- One grouping call's result for one file's claims, and the cache of
+-- groupings: the same claims are never sent again once grouped.
+CREATE TABLE groupings (
+    id INTEGER PRIMARY KEY,
+    blob_hash TEXT NOT NULL,
+    -- The hash of the IDs of the claims that were sent, in order.
+    claims_hash TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    model TEXT NOT NULL,
+    -- 1 when the reply passed validation, 0 for files left not grouped.
+    grouped INTEGER NOT NULL,
+    -- Why the file was left not grouped.
+    reason TEXT,
+    -- The model's last reply, as it arrived.
+    reply TEXT NOT NULL,
+    -- What the grouping's calls used together, retries included.
+    calls INTEGER NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cost_micros INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX groupings_file ON groupings (blob_hash);
+
+-- Claims are atomic or compound. Atomic claims come from an extraction and
+-- rest on a span. Compound claims come from a grouping and have parts.
+CREATE TABLE claims_v7 (
+    id INTEGER PRIMARY KEY,
+    extraction_id INTEGER REFERENCES extractions (id),
+    span_id INTEGER REFERENCES spans (id),
+    grouping_id INTEGER REFERENCES groupings (id),
+    text TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    illustrative INTEGER NOT NULL
+);
+INSERT INTO claims_v7 (id, extraction_id, span_id, text, kind, illustrative)
+SELECT id, extraction_id, span_id, text, kind, illustrative FROM claims;
+DROP TABLE claims;
+ALTER TABLE claims_v7 RENAME TO claims;
+CREATE INDEX claims_extraction ON claims (extraction_id);
+CREATE INDEX claims_grouping ON claims (grouping_id);
+
+-- The claims a compound claim is made of.
+CREATE TABLE claim_parts (
+    claim_id INTEGER NOT NULL REFERENCES claims (id),
+    part_id INTEGER NOT NULL REFERENCES claims (id),
+    PRIMARY KEY (claim_id, part_id)
+);
+
+-- Relations between two claims: duplicates, conflicts or depends_on.
+CREATE TABLE claim_links (
+    id INTEGER PRIMARY KEY,
+    grouping_id INTEGER NOT NULL REFERENCES groupings (id),
+    from_id INTEGER NOT NULL REFERENCES claims (id),
+    to_id INTEGER NOT NULL REFERENCES claims (id),
+    relation TEXT NOT NULL
+);
 ";
 
 /// Opens the database, creating it when the file is new and running the
@@ -564,14 +624,23 @@ impl OutputRatio {
     }
 }
 
-/// Tokens added up over a model's successful calls for one operation.
-pub fn output_ratio(conn: &Connection, operation: &str, model: &str) -> Result<OutputRatio> {
+/// Tokens added up over a model's successful calls for one operation. With
+/// a prompt version, only the calls of runs with that version count, since
+/// wording changes how much a model writes.
+pub fn output_ratio(
+    conn: &Connection,
+    operation: &str,
+    model: &str,
+    prompt_version: Option<&str>,
+) -> Result<OutputRatio> {
     Ok(conn.query_row(
         "SELECT count(*),
                 coalesce(sum(input_tokens + cache_write_tokens + cache_read_tokens), 0),
                 coalesce(sum(output_tokens), 0)
-         FROM model_calls WHERE operation = ?1 AND model = ?2 AND success = 1",
-        params![operation, model],
+         FROM model_calls
+         WHERE operation = ?1 AND model = ?2 AND success = 1
+           AND (?3 IS NULL OR run_id IN (SELECT id FROM runs WHERE prompt_version = ?3))",
+        params![operation, model, prompt_version],
         |row| {
             Ok(OutputRatio {
                 calls: row.get(0)?,
@@ -1201,6 +1270,192 @@ pub fn claims_of_blob(conn: &Connection, blob_hash: &str) -> Result<Vec<ShownCla
                 start_column: row.get(10)?,
                 end_column: row.get(11)?,
             },
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A grouping to record: what was sent, what came back and what it used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Grouping {
+    pub blob_hash: String,
+    /// The hash of the IDs of the claims that were sent, in order.
+    pub claims_hash: String,
+    pub prompt_version: String,
+    pub model: String,
+    /// Why the file was left not grouped. `None` for valid replies.
+    pub reason: Option<String>,
+    pub reply: String,
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_micros: i64,
+}
+
+/// A compound claim to record, with the IDs of its parts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Compound {
+    pub text: String,
+    pub kind: String,
+    pub parts: Vec<i64>,
+}
+
+/// A relation between two claims, by their IDs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Link {
+    pub from_id: i64,
+    pub to_id: i64,
+    pub relation: String,
+}
+
+/// Whether the cache holds a grouping of exactly these claims by this
+/// prompt version and model.
+pub fn is_grouped(
+    conn: &Connection,
+    blob_hash: &str,
+    claims_hash: &str,
+    prompt_version: &str,
+    model: &str,
+) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT count(*) FROM groupings
+         WHERE blob_hash = ?1 AND claims_hash = ?2 AND prompt_version = ?3 AND model = ?4
+           AND grouped = 1",
+        params![blob_hash, claims_hash, prompt_version, model],
+        |row| row.get::<_, i64>(0),
+    )? > 0)
+}
+
+/// Records a grouping with its compound claims and links.
+pub fn record_grouping(
+    conn: &mut Connection,
+    grouping: &Grouping,
+    compounds: &[Compound],
+    links: &[Link],
+) -> Result<()> {
+    let transaction = conn.transaction()?;
+    transaction.execute(
+        "INSERT INTO groupings (blob_hash, claims_hash, prompt_version, model, grouped, reason,
+             reply, calls, input_tokens, output_tokens, cost_micros)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            grouping.blob_hash,
+            grouping.claims_hash,
+            grouping.prompt_version,
+            grouping.model,
+            grouping.reason.is_none(),
+            grouping.reason,
+            grouping.reply,
+            grouping.calls,
+            grouping.input_tokens,
+            grouping.output_tokens,
+            grouping.cost_micros,
+        ],
+    )?;
+    let id = transaction.last_insert_rowid();
+    for compound in compounds {
+        transaction.execute(
+            "INSERT INTO claims (grouping_id, text, kind, illustrative) VALUES (?1, ?2, ?3, 0)",
+            params![id, compound.text, compound.kind],
+        )?;
+        let claim = transaction.last_insert_rowid();
+        for part in &compound.parts {
+            transaction.execute(
+                "INSERT INTO claim_parts (claim_id, part_id) VALUES (?1, ?2)",
+                params![claim, part],
+            )?;
+        }
+    }
+    for link in links {
+        transaction.execute(
+            "INSERT INTO claim_links (grouping_id, from_id, to_id, relation)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, link.from_id, link.to_id, link.relation],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// A recorded grouping with its ID and when it was made, in UTC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedGrouping {
+    pub id: i64,
+    pub created_at: String,
+    pub grouping: Grouping,
+}
+
+/// The latest grouping of a file's contents, valid or not.
+pub fn latest_grouping(conn: &Connection, blob_hash: &str) -> Result<Option<RecordedGrouping>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, created_at, blob_hash, claims_hash, prompt_version, model, reason, reply,
+                    calls, input_tokens, output_tokens, cost_micros
+             FROM groupings WHERE blob_hash = ?1 ORDER BY id DESC LIMIT 1",
+            params![blob_hash],
+            |row| {
+                Ok(RecordedGrouping {
+                    id: row.get(0)?,
+                    created_at: row.get(1)?,
+                    grouping: Grouping {
+                        blob_hash: row.get(2)?,
+                        claims_hash: row.get(3)?,
+                        prompt_version: row.get(4)?,
+                        model: row.get(5)?,
+                        reason: row.get(6)?,
+                        reply: row.get(7)?,
+                        calls: row.get(8)?,
+                        input_tokens: row.get(9)?,
+                        output_tokens: row.get(10)?,
+                        cost_micros: row.get(11)?,
+                    },
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// A compound claim as pages show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownCompound {
+    pub id: i64,
+    pub compound: Compound,
+}
+
+/// A grouping's compound claims with their parts, in the order recorded.
+pub fn compounds(conn: &Connection, grouping_id: i64) -> Result<Vec<ShownCompound>> {
+    let mut statement =
+        conn.prepare("SELECT id, text, kind FROM claims WHERE grouping_id = ?1 ORDER BY id")?;
+    let rows = statement.query_map(params![grouping_id], |row| {
+        Ok(ShownCompound {
+            id: row.get(0)?,
+            compound: Compound {
+                text: row.get(1)?,
+                kind: row.get(2)?,
+                parts: Vec::new(),
+            },
+        })
+    })?;
+    let mut found: Vec<ShownCompound> = rows.collect::<rusqlite::Result<_>>()?;
+    let mut parts =
+        conn.prepare("SELECT part_id FROM claim_parts WHERE claim_id = ?1 ORDER BY part_id")?;
+    for shown in &mut found {
+        let rows = parts.query_map(params![shown.id], |row| row.get::<_, i64>(0))?;
+        shown.compound.parts = rows.collect::<rusqlite::Result<_>>()?;
+    }
+    Ok(found)
+}
+
+/// A grouping's links, in the order recorded.
+pub fn links(conn: &Connection, grouping_id: i64) -> Result<Vec<Link>> {
+    let mut statement = conn.prepare(
+        "SELECT from_id, to_id, relation FROM claim_links WHERE grouping_id = ?1 ORDER BY id",
+    )?;
+    let rows = statement.query_map(params![grouping_id], |row| {
+        Ok(Link {
+            from_id: row.get(0)?,
+            to_id: row.get(1)?,
+            relation: row.get(2)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

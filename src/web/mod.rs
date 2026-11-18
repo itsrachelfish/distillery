@@ -11,6 +11,7 @@
 
 mod estimates;
 mod files;
+mod groups;
 mod jobs;
 mod layout;
 mod runs;
@@ -60,6 +61,7 @@ pub fn run(config: &Config) -> db::Result<()> {
         .merge(files::routes())
         .merge(estimates::routes())
         .merge(runs::routes())
+        .merge(groups::routes())
         .merge(usage::routes())
         .route("/style.css", get(style))
         .fallback(not_found)

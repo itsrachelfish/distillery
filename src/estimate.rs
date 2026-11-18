@@ -82,8 +82,15 @@ pub fn run(
     let extraction = Extraction::load()?;
     // Output can't be counted in advance. It is expected from what the
     // model's earlier extraction calls returned for their input.
-    let ratio = db::output_ratio(conn, prompts::EXTRACT_OPERATION, provider.model())
-        .map_err(|err| format!("Reading earlier calls: {err}"))?;
+    // Calls of this prompt version are the better guide, once it has any.
+    let ratio = |version| {
+        db::output_ratio(conn, prompts::EXTRACT_OPERATION, provider.model(), version)
+            .map_err(|err| format!("Reading earlier calls: {err}"))
+    };
+    let ratio = match ratio(Some(extraction.version.as_str()))? {
+        this_version if this_version.calls > 0 => this_version,
+        _ => ratio(None)?,
+    };
 
     progress.stage("Counting tokens", total as u64, "sections");
     let mut estimates = Vec::with_capacity(cut.len());

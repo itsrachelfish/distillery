@@ -20,6 +20,92 @@ const PROBLEMS: &str = "{problems}";
 /// What usage records call the calls that extract claims.
 pub const EXTRACT_OPERATION: &str = "extract_claims";
 
+const GROUP_CLAIMS: &str = include_str!("../prompts/group_claims.md");
+const GROUPS_SCHEMA: &str = include_str!("../prompts/groups_schema.json");
+const GROUP_RETRY: &str = include_str!("../prompts/group_claims_retry.md");
+
+/// What usage records call the calls that group claims.
+pub const GROUP_OPERATION: &str = "group_claims";
+
+/// A message with a retry prompt under it, listing the problems of an
+/// earlier reply.
+fn with_problems(message: &mut String, retry: &str, problems: &[String]) {
+    let list: Vec<String> = problems
+        .iter()
+        .map(|problem| format!("- {problem}"))
+        .collect();
+    message.push_str("\n\n");
+    message.push_str(&retry.trim_end().replace(PROBLEMS, &list.join("\n")));
+}
+
+/// A claim as grouping calls list it.
+pub struct Listed<'a> {
+    pub kind: &'a str,
+    pub text: &'a str,
+    /// The source text the claim rests on.
+    pub quote: &'a str,
+}
+
+/// Pass 2: the claims of one file grouped into compound claims, one call
+/// per file.
+pub struct Grouping {
+    system: String,
+    schema: Value,
+    /// The same hash as `cat prompts/group_claims.md
+    /// prompts/groups_schema.json prompts/group_claims_retry.md | git
+    /// hash-object --stdin`.
+    pub version: String,
+}
+
+impl Grouping {
+    pub fn load() -> Result<Self, String> {
+        let schema: Value = serde_json::from_str(GROUPS_SCHEMA)
+            .map_err(|err| format!("prompts/groups_schema.json: {err}"))?;
+        let version =
+            git::hash_object(format!("{GROUP_CLAIMS}{GROUPS_SCHEMA}{GROUP_RETRY}").as_bytes())?;
+        Ok(Grouping {
+            system: GROUP_CLAIMS.trim_end().to_owned(),
+            schema,
+            version,
+        })
+    }
+
+    /// The wording of this version: the system prompt, the reply schema and
+    /// the retry prompt.
+    pub fn wording(&self) -> (&'static str, &'static str, &'static str) {
+        (GROUP_CLAIMS, GROUPS_SCHEMA, GROUP_RETRY)
+    }
+
+    /// The call for one file: its claims, numbered from 1 in the order
+    /// given. Source text goes along since input costs little, and notes
+    /// alone leave out context.
+    pub fn prompt(&self, path: &str, claims: &[Listed]) -> Prompt {
+        let mut user = format!("File: {path}\nClaims:");
+        for (index, claim) in claims.iter().enumerate() {
+            // One line per claim, whatever line breaks its source text has.
+            let quote = claim.quote.split_whitespace().collect::<Vec<_>>().join(" ");
+            user.push_str(&format!(
+                "\n{} [{}] {} | {quote}",
+                index + 1,
+                claim.kind,
+                claim.text
+            ));
+        }
+        Prompt {
+            system: Some(self.system.clone()),
+            user,
+            schema: Some(self.schema.clone()),
+        }
+    }
+
+    /// The call for a file again, after a reply with problems.
+    pub fn retry(&self, path: &str, claims: &[Listed], problems: &[String]) -> Prompt {
+        let mut prompt = self.prompt(path, claims);
+        with_problems(&mut prompt.user, GROUP_RETRY, problems);
+        prompt
+    }
+}
+
 /// A section as prompts need it: its lines, the line number of the first,
 /// and its passages.
 pub struct Section<'a> {
@@ -78,18 +164,8 @@ impl Extraction {
         section: &Section,
         problems: &[String],
     ) -> Prompt {
-        let list: Vec<String> = problems
-            .iter()
-            .map(|problem| format!("- {problem}"))
-            .collect();
         let mut prompt = self.prompt(path, headings, section);
-        prompt.user.push_str("\n\n");
-        prompt.user.push_str(
-            RETRY
-                .trim_end()
-                .replace(PROBLEMS, &list.join("\n"))
-                .as_str(),
-        );
+        with_problems(&mut prompt.user, RETRY, problems);
         prompt
     }
 }

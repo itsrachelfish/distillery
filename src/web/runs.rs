@@ -238,9 +238,11 @@ async fn run_page(
                 });
             }
         }
+        let paths: Vec<&str> = run_files.iter().map(|file| file.path.as_str()).collect();
         let view = View {
             recorded: &recorded,
             source: &source,
+            paths: &paths,
             files: run_files.len(),
             estimates: &estimates,
             rows: &rows,
@@ -276,6 +278,8 @@ struct Row {
 struct View<'a> {
     recorded: &'a RecordedRun,
     source: &'a Source,
+    /// The run's files.
+    paths: &'a [&'a str],
     /// How many files the run has.
     files: usize,
     /// The estimates the run's files started from.
@@ -350,6 +354,19 @@ fn page(view: &View) -> Markup {
             (counted(view.files as u64, "file", "files")) " at commit "
             (layout::commit(&run.commit_hash))
             ". Claims show under their sections on each file's page."
+        }
+        form.inline method="post" action="/group" {
+            input type="hidden" name="source" value=(source.id);
+            input type="hidden" name="commit" value=(run.commit_hash);
+            @for path in view.paths {
+                input type="hidden" name="path" value=(path);
+            }
+            button type="submit" { "Group claims" }
+            span.note {
+                "Groups each file's claims into compound claims: one call to the model per "
+                "file, none for files grouped before with the same claims or with fewer than "
+                (crate::group::FEWEST_CLAIMS) " claims."
+            }
         }
 
         table {

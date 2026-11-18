@@ -13,8 +13,11 @@ use serde::Deserialize;
 use super::layout::{self, dollars, number};
 use super::sources::{self as source_pages, Snapshot};
 use super::{App, Flash, PageError, PageResult, estimates, internal, runs, usage, with_db};
-use crate::db::{self, RecordedEstimate, ShownClaim, VersionStats};
+use crate::db::{
+    self, Link, RecordedEstimate, RecordedGrouping, ShownClaim, ShownCompound, VersionStats,
+};
 use crate::git;
+use crate::group;
 use crate::progress::counted;
 use crate::sections::{self, Section};
 
@@ -65,6 +68,17 @@ async fn file_page(
             .map_err(PageError::internal)?;
         let claims = db::claims_of_blob(conn, &blob_hash).map_err(internal)?;
         let versions = db::version_stats(conn, Some(&blob_hash)).map_err(internal)?;
+        // The latest grouping, and whether it grouped the claims shown.
+        let grouping = db::latest_grouping(conn, &blob_hash).map_err(internal)?;
+        let (compounds, links, current) = match &grouping {
+            Some(recorded) if recorded.grouping.reason.is_none() => (
+                db::compounds(conn, recorded.id).map_err(internal)?,
+                db::links(conn, recorded.id).map_err(internal)?,
+                group::claims_hash(&claims).map_err(PageError::internal)?
+                    == recorded.grouping.claims_hash,
+            ),
+            _ => (Vec::new(), Vec::new(), false),
+        };
         let view = View {
             snapshot: &snapshot,
             path: &query.path,
@@ -73,6 +87,10 @@ async fn file_page(
             run,
             claims: &claims,
             versions: &versions,
+            grouping: grouping.as_ref(),
+            compounds: &compounds,
+            links: &links,
+            grouping_current: current,
         };
         Ok(layout::page(&query.path, &flash, page(&view)))
     })
@@ -92,6 +110,13 @@ struct View<'a> {
     claims: &'a [ShownClaim],
     /// The prompt versions that read the file's contents, compared.
     versions: &'a [VersionStats],
+    /// The latest grouping of the file's claims, valid or not.
+    grouping: Option<&'a RecordedGrouping>,
+    /// Its compound claims and links, when it is valid.
+    compounds: &'a [ShownCompound],
+    links: &'a [Link],
+    /// Whether it grouped exactly the claims shown.
+    grouping_current: bool,
 }
 
 fn page(view: &View) -> Markup {
@@ -137,6 +162,9 @@ fn page(view: &View) -> Markup {
         p.note {
             "Sections run from one heading to the next. Each is sent to the model on its own, "
             "with the headings above it as context."
+        }
+        @if view.claims.len() >= group::FEWEST_CLAIMS {
+            (grouped(view))
         }
         @if lines.is_empty() {
             p.empty { "This file is empty." }
@@ -242,6 +270,115 @@ fn claims(found: &[&ShownClaim]) -> Markup {
                             }
                         }
                         " · " q { (claim.quote) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The file's compound claims, and the button that groups its claims. The
+/// button is the only thing that starts a grouping call, and it shows only
+/// while the claims shown aren't grouped.
+fn grouped(view: &View) -> Markup {
+    let source = &view.snapshot.source;
+    let claim = |id: i64| view.claims.iter().find(|shown| shown.id == id);
+    let chars = |text: &str| text.chars().count();
+    // How much shorter the compound claims are than the claims they hold.
+    let parts: Vec<&ShownClaim> = view
+        .compounds
+        .iter()
+        .flat_map(|shown| shown.compound.parts.iter())
+        .filter_map(|id| claim(*id))
+        .collect();
+    let part_chars: usize = parts.iter().map(|shown| chars(&shown.claim.text)).sum();
+    let compound_chars: usize = view
+        .compounds
+        .iter()
+        .map(|shown| chars(&shown.compound.text))
+        .sum();
+    html! {
+        h2 { "Compound claims" }
+        @if !view.grouping_current {
+            form.inline method="post" action="/group" {
+                input type="hidden" name="source" value=(source.id);
+                input type="hidden" name="commit" value=(view.snapshot.commit);
+                input type="hidden" name="path" value=(view.path);
+                button type="submit" { "Group claims" }
+                span.note {
+                    "One call to the model with "
+                    (counted(view.claims.len() as u64, "claim", "claims"))
+                    ". Only this button starts it, and the same claims are never sent twice."
+                }
+            }
+        }
+        @if let Some(recorded) = view.grouping {
+            @let grouping = &recorded.grouping;
+            @if let Some(reason) = &grouping.reason {
+                p.note {
+                    span.failed { "Not grouped" }
+                    @for line in reason.lines() {
+                        br;
+                        (line)
+                    }
+                }
+                details {
+                    summary.note { "The model's reply" }
+                    pre.reply { (grouping.reply) }
+                }
+            } @else {
+                p.note {
+                    strong { "AI proposal" }
+                    " · " (counted(view.compounds.len() as u64, "compound claim", "compound claims"))
+                    " from " code { (grouping.model) } ", prompt version "
+                    (layout::commit(&grouping.prompt_version))
+                    " · " (counted(grouping.calls as u64, "call", "calls")) ", "
+                    (number(grouping.input_tokens)) " tokens in, "
+                    (number(grouping.output_tokens)) " out, " (dollars(grouping.cost_micros))
+                    " · " (layout::utc(&recorded.created_at))
+                }
+                p.note {
+                    (counted(parts.len() as u64, "claim", "claims")) " of "
+                    (number(view.claims.len() as i64)) " grouped: " (number(part_chars as i64))
+                    " characters of notes became " (number(compound_chars as i64))
+                    " characters of compound claims."
+                    @if !view.grouping_current {
+                        " " span.failed { "The claims changed since this grouping." }
+                    }
+                }
+                ul {
+                    @for shown in view.compounds {
+                        li id=(format!("C{}", shown.id)) {
+                            span.kind { (shown.compound.kind) }
+                            " " (shown.compound.text)
+                            ul {
+                                @for part in &shown.compound.parts {
+                                    li.note {
+                                        @if let Some(part) = claim(*part) {
+                                            a href=(format!("#C{}", part.id)) { (part.claim.text) }
+                                        } @else {
+                                            "A claim no longer shown"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                @if !view.links.is_empty() {
+                    p.note { "Relations between claims:" }
+                    ul {
+                        @for link in view.links {
+                            li.note {
+                                @if let (Some(from), Some(to)) = (claim(link.from_id), claim(link.to_id)) {
+                                    a href=(format!("#C{}", from.id)) { (from.claim.text) }
+                                    " " span.kind { (link.relation.replace('_', " ")) } " "
+                                    a href=(format!("#C{}", to.id)) { (to.claim.text) }
+                                } @else {
+                                    "Claims no longer shown"
+                                }
+                            }
+                        }
                     }
                 }
             }

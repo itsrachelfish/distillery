@@ -4,6 +4,7 @@ mod db;
 mod estimate;
 mod extract;
 mod git;
+mod group;
 mod model;
 mod passages;
 mod progress;
