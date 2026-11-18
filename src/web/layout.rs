@@ -38,6 +38,7 @@ fn frame(title: &str, flash: &Flash, body: Markup, reload: Option<u32>) -> Marku
                         a.brand href="/" { "Distillery" }
                         a href="/" { "Sources" }
                         a href="/job" { "Job" }
+                        a href="/usage" { "Usage" }
                     }
                 }
                 main {
@@ -81,6 +82,23 @@ pub fn commit(hash: &str) -> Markup {
     html! {
         code title=(hash) { (short) }
     }
+}
+
+/// A cost in US dollars, from millionths of a dollar. Costs under a dollar
+/// show four decimals, since one call often costs less than a cent.
+pub fn dollars(micros: i64) -> String {
+    let dollars = micros as f64 / 1_000_000.0;
+    if micros.abs() < 1_000_000 {
+        format!("${dollars:.4}")
+    } else {
+        format!("${dollars:.2}")
+    }
+}
+
+/// A count with thousands separators.
+pub fn number(n: i64) -> String {
+    let digits = crate::progress::thousands(n.unsigned_abs());
+    if n < 0 { format!("-{digits}") } else { digits }
 }
 
 /// A time the database recorded, which SQLite keeps in UTC.

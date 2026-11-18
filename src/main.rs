@@ -1,6 +1,8 @@
+mod anthropic;
 mod config;
 mod db;
 mod git;
+mod model;
 mod progress;
 mod sections;
 mod snapshot;
@@ -70,6 +72,14 @@ fn run(cli: Cli) -> db::Result<()> {
             println!("Settings: {}", cli.config.display());
             println!("Reviewer: {}", config.review.reviewer);
             println!("Model: {}", config.model.name);
+            println!(
+                "API key: {}",
+                if config.model.api_key.is_empty() {
+                    "not set"
+                } else {
+                    "set"
+                }
+            );
             println!(
                 "Database: {} (schema version {})",
                 database.display(),

@@ -13,6 +13,7 @@ mod files;
 mod jobs;
 mod layout;
 mod sources;
+mod usage;
 
 use std::fmt::Display;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -29,7 +30,7 @@ use maud::{Markup, html};
 use rusqlite::Connection;
 use serde::Deserialize;
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::db;
 
 const STYLE: &str = include_str!("style.css");
@@ -38,6 +39,7 @@ const STYLE: &str = include_str!("style.css");
 struct App {
     db: Arc<PathBuf>,
     clone_dir: Arc<PathBuf>,
+    model: Arc<config::Model>,
     port: u16,
 }
 
@@ -47,12 +49,14 @@ pub fn run(config: &Config) -> db::Result<()> {
     let app = App {
         db: Arc::new(config.storage.database.clone()),
         clone_dir: Arc::new(config.storage.clone_dir.clone()),
+        model: Arc::new(config.model.clone()),
         port,
     };
     let router = Router::new()
         .merge(sources::routes())
         .merge(jobs::routes())
         .merge(files::routes())
+        .merge(usage::routes())
         .route("/style.css", get(style))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(app.clone(), guard))
@@ -200,6 +204,11 @@ fn internal(err: impl Display) -> PageError {
 struct Flash {
     notice: Option<String>,
     error: Option<String>,
+}
+
+/// Redirects to `back` with a notice.
+fn done(back: &str, notice: &str) -> Redirect {
+    flash(back, "notice", notice)
 }
 
 /// Redirects to `back` with an error.

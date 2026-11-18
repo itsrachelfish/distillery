@@ -1,6 +1,6 @@
 //! Distillery's settings, read from a TOML file laid out like
-//! `distillery.example.toml`. The API key is never a setting: it comes only
-//! from the `ANTHROPIC_API_KEY` environment variable.
+//! `distillery.example.toml`. The file holds the model API key, so git
+//! ignores `distillery.toml`.
 
 use std::fs;
 use std::io::ErrorKind;
@@ -42,6 +42,19 @@ pub struct Review {
 pub struct Model {
     #[serde(default = "default_model")]
     pub name: String,
+    /// The API key for the model's provider. Empty when not set. Never
+    /// shown on pages or written to the database or logs.
+    #[serde(default)]
+    pub api_key: String,
+    /// US dollars per million input tokens.
+    #[serde(default = "default_input_price")]
+    pub input_price: f64,
+    /// US dollars per million output tokens.
+    #[serde(default = "default_output_price")]
+    pub output_price: f64,
+    /// Runs stop once their recorded cost passes this many US dollars.
+    #[serde(default = "default_max_run_cost")]
+    pub max_run_cost: f64,
 }
 
 /// Where Distillery keeps its data.
@@ -64,6 +77,18 @@ fn default_model() -> String {
     "claude-opus-5-5".to_owned()
 }
 
+fn default_input_price() -> f64 {
+    4.0
+}
+
+fn default_output_price() -> f64 {
+    20.0
+}
+
+fn default_max_run_cost() -> f64 {
+    2.0
+}
+
 fn default_database() -> PathBuf {
     PathBuf::from("distillery.sqlite")
 }
@@ -84,6 +109,10 @@ impl Default for Model {
     fn default() -> Self {
         Model {
             name: default_model(),
+            api_key: String::new(),
+            input_price: default_input_price(),
+            output_price: default_output_price(),
+            max_run_cost: default_max_run_cost(),
         }
     }
 }
@@ -143,6 +172,24 @@ impl Config {
         let model = &self.model.name;
         if model.is_empty() || model.contains(|c: char| c.is_whitespace() || c.is_control()) {
             return Err("model.name must be a model name without spaces".to_owned());
+        }
+        if self
+            .model
+            .api_key
+            .contains(|c: char| c.is_whitespace() || c.is_control())
+        {
+            return Err("model.api_key must be the key alone, without spaces".to_owned());
+        }
+        for (setting, amount) in [
+            ("model.input_price", self.model.input_price),
+            ("model.output_price", self.model.output_price),
+            ("model.max_run_cost", self.model.max_run_cost),
+        ] {
+            if !amount.is_finite() || amount < 0.0 {
+                return Err(format!(
+                    "{setting} must be an amount in US dollars, zero or more"
+                ));
+            }
         }
 
         if self.storage.database.as_os_str().is_empty() {
@@ -222,8 +269,18 @@ mod tests {
         let text = format!("{MINIMAL}[storage]\nrepos = [\"https://example.net/a.git\"]\n");
         assert!(Config::parse(&text).is_err());
 
-        // The API key comes only from the environment.
+        let text = format!("{MINIMAL}[model]\nkey = \"secret\"\n");
+        assert!(Config::parse(&text).is_err());
+    }
+
+    #[test]
+    fn reads_the_api_key() {
+        assert_eq!(Config::parse(MINIMAL).unwrap().model.api_key, "");
+
         let text = format!("{MINIMAL}[model]\napi_key = \"secret\"\n");
+        assert_eq!(Config::parse(&text).unwrap().model.api_key, "secret");
+
+        let text = format!("{MINIMAL}[model]\napi_key = \"two words\"\n");
         assert!(Config::parse(&text).is_err());
     }
 

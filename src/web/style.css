@@ -11,6 +11,7 @@
     --accent: #2f7d6d;
     --notice-background: #e5f4ef;
     --error-background: #fbe9e7;
+    --danger: #b3261e;
     color-scheme: light dark;
 }
 
@@ -25,6 +26,7 @@
         --accent: #5fbfa9;
         --notice-background: #18332c;
         --error-background: #3b1d1a;
+        --danger: #f28b82;
     }
 }
 
@@ -286,4 +288,19 @@ table.lines tr.section-start td {
 
 table.lines tr.section-start:first-child td {
     border-top: 0;
+}
+
+th[scope="row"] {
+    width: 12rem;
+    white-space: nowrap;
+}
+
+caption {
+    caption-side: bottom;
+    padding-top: 0.4rem;
+    text-align: left;
+}
+
+.failed {
+    color: var(--danger);
 }

@@ -18,7 +18,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema, as the steps that build it. Steps are only ever added at the
 /// end: released steps never change.
-const MIGRATIONS: [&str; 1] = [SCHEMA_V1];
+const MIGRATIONS: [&str; 2] = [SCHEMA_V1, SCHEMA_V2];
 
 const SCHEMA_V1: &str = "
 -- Git repositories added by users.
@@ -43,6 +43,34 @@ CREATE TABLE revisions (
     recorded_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (source_id, commit_hash)
 );
+";
+
+const SCHEMA_V2: &str = "
+-- Every call to a model API, failed calls included, for usage and cost.
+CREATE TABLE model_calls (
+    id INTEGER PRIMARY KEY,
+    -- The API called, such as anthropic.
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    -- What the call was for, such as check_key.
+    operation TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    -- Input tokens written to and read from the provider's prompt cache.
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    -- Millionths of a US dollar, from the prices configured at call time.
+    cost_micros INTEGER NOT NULL DEFAULT 0,
+    duration_ms INTEGER NOT NULL,
+    -- Why the model stopped, when the reply says.
+    stop_reason TEXT,
+    -- 1 when the call returned a usable reply.
+    success INTEGER NOT NULL,
+    error TEXT,
+    -- UTC, as YYYY-MM-DD HH:MM:SS.
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX model_calls_created_at ON model_calls (created_at);
 ";
 
 /// Opens the database, creating it when the file is new and running the
@@ -170,6 +198,132 @@ pub fn revisions(conn: &Connection, source_id: i64) -> Result<Vec<Revision>> {
         Ok(Revision {
             commit_hash: row.get(0)?,
             recorded_at: row.get(1)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// One call to a model API, as recorded for usage and cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCall {
+    pub provider: String,
+    pub model: String,
+    pub operation: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cache_read_tokens: i64,
+    /// Millionths of a US dollar.
+    pub cost_micros: i64,
+    pub duration_ms: i64,
+    pub stop_reason: Option<String>,
+    /// `None` when the call returned a usable reply.
+    pub error: Option<String>,
+}
+
+/// Records a call to a model API.
+pub fn record_model_call(conn: &Connection, call: &ModelCall) -> Result<()> {
+    conn.execute(
+        "INSERT INTO model_calls (provider, model, operation, input_tokens, output_tokens,
+             cache_write_tokens, cache_read_tokens, cost_micros, duration_ms, stop_reason,
+             success, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            call.provider,
+            call.model,
+            call.operation,
+            call.input_tokens,
+            call.output_tokens,
+            call.cache_write_tokens,
+            call.cache_read_tokens,
+            call.cost_micros,
+            call.duration_ms,
+            call.stop_reason,
+            call.error.is_none(),
+            call.error,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Calls added up over a group, such as one model or one day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsageTotal {
+    /// What the group is: a model name, a day, or an operation.
+    pub group: String,
+    pub calls: i64,
+    pub failed: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_micros: i64,
+}
+
+/// How usage totals are grouped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageGroup {
+    Model,
+    Operation,
+    /// UTC days, latest first.
+    Day,
+}
+
+/// Usage added up by model, operation or day.
+pub fn usage_totals(conn: &Connection, group: UsageGroup) -> Result<Vec<UsageTotal>> {
+    // Both parts are fixed text, never user input.
+    let (column, order) = match group {
+        UsageGroup::Model => ("model", "1"),
+        UsageGroup::Operation => ("operation", "1"),
+        UsageGroup::Day => ("date(created_at)", "1 DESC"),
+    };
+    let mut statement = conn.prepare(&format!(
+        "SELECT {column}, count(*), sum(1 - success), sum(input_tokens), sum(output_tokens),
+                sum(cost_micros)
+         FROM model_calls GROUP BY 1 ORDER BY {order}"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok(UsageTotal {
+            group: row.get(0)?,
+            calls: row.get(1)?,
+            failed: row.get(2)?,
+            input_tokens: row.get(3)?,
+            output_tokens: row.get(4)?,
+            cost_micros: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A recorded call with when it was made, in UTC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedCall {
+    pub created_at: String,
+    pub call: ModelCall,
+}
+
+/// The latest calls, newest first.
+pub fn latest_model_calls(conn: &Connection, limit: i64) -> Result<Vec<RecordedCall>> {
+    let mut statement = conn.prepare(
+        "SELECT created_at, provider, model, operation, input_tokens, output_tokens,
+                cache_write_tokens, cache_read_tokens, cost_micros, duration_ms, stop_reason,
+                error
+         FROM model_calls ORDER BY id DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map(params![limit], |row| {
+        Ok(RecordedCall {
+            created_at: row.get(0)?,
+            call: ModelCall {
+                provider: row.get(1)?,
+                model: row.get(2)?,
+                operation: row.get(3)?,
+                input_tokens: row.get(4)?,
+                output_tokens: row.get(5)?,
+                cache_write_tokens: row.get(6)?,
+                cache_read_tokens: row.get(7)?,
+                cost_micros: row.get(8)?,
+                duration_ms: row.get(9)?,
+                stop_reason: row.get(10)?,
+                error: row.get(11)?,
+            },
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

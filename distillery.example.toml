@@ -10,8 +10,17 @@ reviewer = "Rachel Fish"
 
 [model]
 # Anthropic model for new runs. Each run records its model.
-# The API key comes only from the ANTHROPIC_API_KEY environment variable.
 name = "claude-opus-5-5"
+# Anthropic API key, from https://platform.claude.com/settings/keys
+# Keep it in distillery.toml only, which git ignores.
+api_key = ""
+# Prices in US dollars per million tokens, used for the cost recorded with
+# each API call. Change them together with the model:
+# https://platform.claude.com/docs/en/about-claude/pricing
+input_price = 4.00
+output_price = 20.00
+# Runs stop once their recorded cost passes this many US dollars.
+max_run_cost = 2.00
 
 [storage]
 # SQLite database, created when missing.
