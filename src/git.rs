@@ -6,7 +6,7 @@
 //! needs for the age of each file.
 
 use std::fs;
-use std::io::{ErrorKind, Read};
+use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -171,6 +171,37 @@ pub fn file_at(clone: &Path, commit: &str, path: &str) -> Result<String, String>
     command.arg(format!("{commit}:{path}"));
     let contents = run_captured(command, "git cat-file")?;
     Ok(String::from_utf8_lossy(&contents).into_owned())
+}
+
+/// The hash git gives a file with these contents, as `git hash-object`
+/// prints it. Nothing is written to any repository.
+pub fn hash_object(contents: &[u8]) -> Result<String, String> {
+    let name = "git hash-object";
+    let mut child = git()
+        .args(["hash-object", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("running {name}: {err}. Is git installed?"))?;
+    // Git reads everything before it prints the hash, and the input is
+    // closed when `stdin` is dropped at the end of this statement.
+    let written = child
+        .stdin
+        .take()
+        .expect("standard input is piped")
+        .write_all(contents);
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("waiting for {name}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{name} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    written.map_err(|err| format!("writing to {name}: {err}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
 /// Whether a path ends in `.md` or `.markdown`, in any letter case.

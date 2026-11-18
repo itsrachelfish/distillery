@@ -1,0 +1,21 @@
+{
+  "type": "object",
+  "properties": {
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "text": { "type": "string", "description": "The claim as one concise statement" },
+          "kind": { "type": "string", "enum": ["behavior", "configuration", "requirement", "decision", "instruction", "rationale"] },
+          "quote": { "type": "string", "description": "Exact text from the section that the claim rests on" },
+          "illustrative": { "type": "boolean", "description": "True for examples, not facts about the project" }
+        },
+        "required": ["text", "kind", "quote", "illustrative"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["claims"],
+  "additionalProperties": false
+}

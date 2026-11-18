@@ -1,4 +1,5 @@
-//! Jobs: long work started from a page, such as the snapshot of a source.
+//! Jobs: long work started from a page, such as the snapshot of a source
+//! or the estimate for a file.
 //!
 //! One job runs at a time, on its own thread, as plain synchronous code.
 //! The Job page reads the job's shared progress report and reloads itself
@@ -26,8 +27,17 @@ use crate::snapshot;
 /// How often the Job page reloads while a job runs.
 const RELOAD_SECONDS: u32 = 2;
 
-/// What a job says when it ends: what it did, or why it failed.
-type Outcome = Result<String, String>;
+/// What a job that worked says when it ends.
+#[derive(Clone)]
+pub(super) struct Finished {
+    /// What the job did.
+    pub said: String,
+    /// Where its result is: the words of a link and its address.
+    pub link: Option<(String, String)>,
+}
+
+/// How a job ends: with what it did, or why it failed.
+pub(super) type Outcome = Result<Finished, String>;
 
 /// The job under way, or the last one that ran.
 struct Job {
@@ -109,16 +119,33 @@ async fn start_snapshot(State(app): State<App>, Form(form): Form<SnapshotForm>) 
         Err(err) => return failed("/", err),
     };
 
+    let title = format!("Snapshot of {}", repo.url);
+    let started = start(title, move |progress| {
+        run_snapshot(&app.db, &app.clone_dir, &repo.url, progress)
+    });
+    if started {
+        Redirect::to("/job")
+    } else {
+        failed("/job", BUSY)
+    }
+}
+
+/// What starting a job says while another one runs.
+pub(super) const BUSY: &str = "Another job is running. Start this one when it ends.";
+
+/// Starts a job on a thread of its own, unless one is running. Returns
+/// whether it started. The Job page shows its progress and how it ended.
+pub(super) fn start<F>(title: String, work: F) -> bool
+where
+    F: FnOnce(&mut Progress) -> Outcome + Send + 'static,
+{
     let mut slot = job();
     if slot.as_ref().is_some_and(|job| job.outcome.is_none()) {
-        return failed(
-            "/job",
-            "Another job is running. Start this one when it ends.",
-        );
+        return false;
     }
     let report: SharedReport = Arc::default();
     *slot = Some(Job {
-        title: format!("Snapshot of {}", repo.url),
+        title,
         report: Arc::clone(&report),
         started: Instant::now(),
         outcome: None,
@@ -128,31 +155,34 @@ async fn start_snapshot(State(app): State<App>, Form(form): Form<SnapshotForm>) 
     thread::spawn(move || {
         let mut progress = Progress::to_stderr_and(report);
         // A panic would otherwise leave the job running for good.
-        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-            run_snapshot(&app.db, &app.clone_dir, &repo.url, &mut progress)
-        }))
-        .unwrap_or_else(|_| Err("The job stopped unexpectedly; see the terminal.".into()));
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| work(&mut progress)))
+            .unwrap_or_else(|_| Err("The job stopped unexpectedly; see the terminal.".into()));
+        // The last line leaves the terminal before the job shows as ended.
+        drop(progress);
         if let Some(job) = job().as_mut() {
             let took = job.started.elapsed();
             job.outcome = Some((outcome, took));
         }
     });
-    Redirect::to("/job")
+    true
 }
 
 fn run_snapshot(database: &Path, clone_dir: &Path, url: &str, progress: &mut Progress) -> Outcome {
     let conn = db::open(database).map_err(|err| format!("Opening the database: {err}"))?;
     let found = snapshot::run(&conn, clone_dir, url, progress).map_err(|err| err.to_string())?;
-    Ok(format!(
-        "Recorded commit {}, which {}. It has {}.",
-        found.commit,
-        if found.new_commit {
-            "is new"
-        } else {
-            "an earlier snapshot recorded already"
-        },
-        counted(found.files.len() as u64, "Markdown file", "Markdown files")
-    ))
+    Ok(Finished {
+        said: format!(
+            "Recorded commit {}, which {}. It has {}.",
+            found.commit,
+            if found.new_commit {
+                "is new"
+            } else {
+                "an earlier snapshot recorded already"
+            },
+            counted(found.files.len() as u64, "Markdown file", "Markdown files")
+        ),
+        link: None,
+    })
 }
 
 fn page(status: Option<&Status>) -> Markup {
@@ -229,7 +259,13 @@ fn status_section(status: &Status) -> Markup {
                     "This page reloads every " (RELOAD_SECONDS) " seconds until the job ends. "
                     "Progress also shows in the terminal running the server."
                 },
-                Some(Ok(said)) => p.flash.notice role="status" { (said) },
+                Some(Ok(finished)) => p.flash.notice role="status" {
+                    (finished.said)
+                    @if let Some((words, address)) = &finished.link {
+                        " "
+                        a href=(address) { (words) }
+                    }
+                },
                 Some(Err(err)) => p.flash.error role="alert" { (err) },
             }
         }

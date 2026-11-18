@@ -18,7 +18,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema, as the steps that build it. Steps are only ever added at the
 /// end: released steps never change.
-const MIGRATIONS: [&str; 2] = [SCHEMA_V1, SCHEMA_V2];
+const MIGRATIONS: [&str; 3] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
 
 const SCHEMA_V1: &str = "
 -- Git repositories added by users.
@@ -71,6 +71,52 @@ CREATE TABLE model_calls (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX model_calls_created_at ON model_calls (created_at);
+";
+
+const SCHEMA_V3: &str = "
+-- The HTTP status of a failed call's reply, such as 429 for a rate limit.
+-- NULL for successful calls and for calls that got no reply.
+ALTER TABLE model_calls ADD COLUMN http_status INTEGER;
+
+-- What distilling a file was expected to cost, counted before any run and
+-- never changed, for comparison with what runs cost.
+CREATE TABLE estimates (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources (id),
+    -- The full commit hash the file was read at.
+    commit_hash TEXT NOT NULL,
+    path TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    -- The hash of the prompt and reply schema that were counted.
+    prompt_version TEXT NOT NULL,
+    -- Sections holding a heading alone, which need no call.
+    skipped_sections INTEGER NOT NULL,
+    -- Input tokens over every section to send, as the provider counted them.
+    input_tokens INTEGER NOT NULL,
+    -- Millionths of a US dollar, from the prices configured at the time.
+    input_cost_micros INTEGER NOT NULL,
+    -- Expected from the output-to-input ratio of the model's earlier
+    -- extraction calls. NULL when there were none.
+    output_tokens INTEGER,
+    output_cost_micros INTEGER,
+    -- How many earlier calls the ratio came from.
+    ratio_calls INTEGER NOT NULL,
+    -- UTC, as YYYY-MM-DD HH:MM:SS.
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX estimates_file ON estimates (source_id, commit_hash, path);
+
+-- The sections an estimate counted, one call each.
+CREATE TABLE estimate_sections (
+    estimate_id INTEGER NOT NULL REFERENCES estimates (id),
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    -- The system prompt, reply schema and section together, as one call
+    -- sends them.
+    input_tokens INTEGER NOT NULL,
+    PRIMARY KEY (estimate_id, start_line)
+);
 ";
 
 /// Opens the database, creating it when the file is new and running the
@@ -219,6 +265,8 @@ pub struct ModelCall {
     pub stop_reason: Option<String>,
     /// `None` when the call returned a usable reply.
     pub error: Option<String>,
+    /// The HTTP status of a failed call's reply, when one arrived.
+    pub http_status: Option<i64>,
 }
 
 /// Records a call to a model API.
@@ -226,8 +274,8 @@ pub fn record_model_call(conn: &Connection, call: &ModelCall) -> Result<()> {
     conn.execute(
         "INSERT INTO model_calls (provider, model, operation, input_tokens, output_tokens,
              cache_write_tokens, cache_read_tokens, cost_micros, duration_ms, stop_reason,
-             success, error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             success, error, http_status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             call.provider,
             call.model,
@@ -241,6 +289,7 @@ pub fn record_model_call(conn: &Connection, call: &ModelCall) -> Result<()> {
             call.stop_reason,
             call.error.is_none(),
             call.error,
+            call.http_status,
         ],
     )?;
     Ok(())
@@ -253,6 +302,8 @@ pub struct UsageTotal {
     pub group: String,
     pub calls: i64,
     pub failed: i64,
+    /// Failed calls the API turned away with a rate limit.
+    pub rate_limited: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub cost_micros: i64,
@@ -276,8 +327,9 @@ pub fn usage_totals(conn: &Connection, group: UsageGroup) -> Result<Vec<UsageTot
         UsageGroup::Day => ("date(created_at)", "1 DESC"),
     };
     let mut statement = conn.prepare(&format!(
-        "SELECT {column}, count(*), sum(1 - success), sum(input_tokens), sum(output_tokens),
-                sum(cost_micros)
+        "SELECT {column}, count(*), sum(1 - success),
+                count(CASE WHEN http_status = 429 THEN 1 END),
+                sum(input_tokens), sum(output_tokens), sum(cost_micros)
          FROM model_calls GROUP BY 1 ORDER BY {order}"
     ))?;
     let rows = statement.query_map([], |row| {
@@ -285,9 +337,10 @@ pub fn usage_totals(conn: &Connection, group: UsageGroup) -> Result<Vec<UsageTot
             group: row.get(0)?,
             calls: row.get(1)?,
             failed: row.get(2)?,
-            input_tokens: row.get(3)?,
-            output_tokens: row.get(4)?,
-            cost_micros: row.get(5)?,
+            rate_limited: row.get(3)?,
+            input_tokens: row.get(4)?,
+            output_tokens: row.get(5)?,
+            cost_micros: row.get(6)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -305,7 +358,7 @@ pub fn latest_model_calls(conn: &Connection, limit: i64) -> Result<Vec<RecordedC
     let mut statement = conn.prepare(
         "SELECT created_at, provider, model, operation, input_tokens, output_tokens,
                 cache_write_tokens, cache_read_tokens, cost_micros, duration_ms, stop_reason,
-                error
+                error, http_status
          FROM model_calls ORDER BY id DESC LIMIT ?1",
     )?;
     let rows = statement.query_map(params![limit], |row| {
@@ -323,7 +376,199 @@ pub fn latest_model_calls(conn: &Connection, limit: i64) -> Result<Vec<RecordedC
                 duration_ms: row.get(9)?,
                 stop_reason: row.get(10)?,
                 error: row.get(11)?,
+                http_status: row.get(12)?,
             },
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Output and input tokens of earlier calls, for expecting output before a
+/// run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputRatio {
+    pub calls: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+}
+
+impl OutputRatio {
+    /// The output tokens to expect for `input_tokens` of input. `None`
+    /// without earlier calls to go by.
+    pub fn output_for(&self, input_tokens: i64) -> Option<i64> {
+        if self.calls == 0 || self.input_tokens == 0 {
+            return None;
+        }
+        let ratio = self.output_tokens as f64 / self.input_tokens as f64;
+        Some((input_tokens as f64 * ratio).round() as i64)
+    }
+}
+
+/// Tokens added up over a model's successful calls for one operation.
+pub fn output_ratio(conn: &Connection, operation: &str, model: &str) -> Result<OutputRatio> {
+    Ok(conn.query_row(
+        "SELECT count(*), coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0)
+         FROM model_calls WHERE operation = ?1 AND model = ?2 AND success = 1",
+        params![operation, model],
+        |row| {
+            Ok(OutputRatio {
+                calls: row.get(0)?,
+                input_tokens: row.get(1)?,
+                output_tokens: row.get(2)?,
+            })
+        },
+    )?)
+}
+
+/// What distilling a file was expected to cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Estimate {
+    pub source_id: i64,
+    /// The full commit hash the file was read at.
+    pub commit_hash: String,
+    pub path: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt_version: String,
+    /// Sections holding a heading alone, which need no call.
+    pub skipped_sections: i64,
+    pub input_tokens: i64,
+    /// Millionths of a US dollar.
+    pub input_cost_micros: i64,
+    /// `None` without earlier extraction calls to go by.
+    pub output_tokens: Option<i64>,
+    pub output_cost_micros: Option<i64>,
+    /// How many earlier calls the expected output came from.
+    pub ratio_calls: i64,
+}
+
+/// A section an estimate counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EstimateSection {
+    pub start_line: i64,
+    pub end_line: i64,
+    pub input_tokens: i64,
+}
+
+/// Records an estimate with its sections, and returns its ID.
+pub fn record_estimate(
+    conn: &mut Connection,
+    estimate: &Estimate,
+    sections: &[EstimateSection],
+) -> Result<i64> {
+    let transaction = conn.transaction()?;
+    transaction.execute(
+        "INSERT INTO estimates (source_id, commit_hash, path, provider, model, prompt_version,
+             skipped_sections, input_tokens, input_cost_micros, output_tokens,
+             output_cost_micros, ratio_calls)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            estimate.source_id,
+            estimate.commit_hash,
+            estimate.path,
+            estimate.provider,
+            estimate.model,
+            estimate.prompt_version,
+            estimate.skipped_sections,
+            estimate.input_tokens,
+            estimate.input_cost_micros,
+            estimate.output_tokens,
+            estimate.output_cost_micros,
+            estimate.ratio_calls,
+        ],
+    )?;
+    let id = transaction.last_insert_rowid();
+    for section in sections {
+        transaction.execute(
+            "INSERT INTO estimate_sections (estimate_id, start_line, end_line, input_tokens)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id,
+                section.start_line,
+                section.end_line,
+                section.input_tokens
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(id)
+}
+
+/// An estimate with its ID and when it was counted, in UTC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedEstimate {
+    pub id: i64,
+    pub created_at: String,
+    pub estimate: Estimate,
+}
+
+const ESTIMATE_COLUMNS: &str = "id, created_at, source_id, commit_hash, path, provider, model,
+    prompt_version, skipped_sections, input_tokens, input_cost_micros, output_tokens,
+    output_cost_micros, ratio_calls";
+
+fn read_estimate(row: &rusqlite::Row) -> rusqlite::Result<RecordedEstimate> {
+    Ok(RecordedEstimate {
+        id: row.get(0)?,
+        created_at: row.get(1)?,
+        estimate: Estimate {
+            source_id: row.get(2)?,
+            commit_hash: row.get(3)?,
+            path: row.get(4)?,
+            provider: row.get(5)?,
+            model: row.get(6)?,
+            prompt_version: row.get(7)?,
+            skipped_sections: row.get(8)?,
+            input_tokens: row.get(9)?,
+            input_cost_micros: row.get(10)?,
+            output_tokens: row.get(11)?,
+            output_cost_micros: row.get(12)?,
+            ratio_calls: row.get(13)?,
+        },
+    })
+}
+
+/// The estimate with this ID, if there is one.
+pub fn find_estimate(conn: &Connection, id: i64) -> Result<Option<RecordedEstimate>> {
+    Ok(conn
+        .query_row(
+            &format!("SELECT {ESTIMATE_COLUMNS} FROM estimates WHERE id = ?1"),
+            params![id],
+            read_estimate,
+        )
+        .optional()?)
+}
+
+/// The latest estimate for a file at a commit, if it has one.
+pub fn latest_estimate(
+    conn: &Connection,
+    source_id: i64,
+    commit_hash: &str,
+    path: &str,
+) -> Result<Option<RecordedEstimate>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {ESTIMATE_COLUMNS} FROM estimates
+                 WHERE source_id = ?1 AND commit_hash = ?2 AND path = ?3
+                 ORDER BY id DESC LIMIT 1"
+            ),
+            params![source_id, commit_hash, path],
+            read_estimate,
+        )
+        .optional()?)
+}
+
+/// The sections an estimate counted, in file order.
+pub fn estimate_sections(conn: &Connection, estimate_id: i64) -> Result<Vec<EstimateSection>> {
+    let mut statement = conn.prepare(
+        "SELECT start_line, end_line, input_tokens FROM estimate_sections
+         WHERE estimate_id = ?1 ORDER BY start_line",
+    )?;
+    let rows = statement.query_map(params![estimate_id], |row| {
+        Ok(EstimateSection {
+            start_line: row.get(0)?,
+            end_line: row.get(1)?,
+            input_tokens: row.get(2)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

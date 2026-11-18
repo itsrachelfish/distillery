@@ -57,6 +57,25 @@ pub struct Model {
     pub max_run_cost: f64,
 }
 
+impl Model {
+    /// The cost of input tokens at the configured price, in millionths of a
+    /// US dollar. Prices are dollars per million tokens, so cost is tokens
+    /// times price.
+    pub fn input_cost_micros(&self, tokens: i64) -> i64 {
+        (tokens as f64 * self.input_price).round() as i64
+    }
+
+    /// The cost of output tokens, in millionths of a US dollar.
+    pub fn output_cost_micros(&self, tokens: i64) -> i64 {
+        (tokens as f64 * self.output_price).round() as i64
+    }
+
+    /// The run cost limit, in millionths of a US dollar.
+    pub fn max_run_cost_micros(&self) -> i64 {
+        (self.max_run_cost * 1_000_000.0).round() as i64
+    }
+}
+
 /// Where Distillery keeps its data.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]

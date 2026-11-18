@@ -1,6 +1,7 @@
 //! The File page: a Markdown file at a recorded commit, as source text
 //! with line numbers, cut into its sections. Claims cite source lines, so
-//! pages show the source and never render it as HTML.
+//! pages show the source and never render it as HTML. "Distill" starts
+//! with an estimate of what the file would cost.
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -8,8 +9,10 @@ use axum::routing::get;
 use maud::{Markup, html};
 use serde::Deserialize;
 
+use super::layout::{self, dollars, number};
 use super::sources::{self as source_pages, Snapshot};
-use super::{App, Flash, PageError, PageResult, layout, with_db};
+use super::{App, Flash, PageError, PageResult, estimates, internal, with_db};
+use crate::db::{self, RecordedEstimate};
 use crate::git;
 use crate::progress::counted;
 use crate::sections;
@@ -51,16 +54,23 @@ async fn file_page(
         }
         let contents = git::file_at(&snapshot.clone, &snapshot.commit, &query.path)
             .map_err(PageError::internal)?;
+        let estimate = db::latest_estimate(conn, snapshot.source.id, &snapshot.commit, &query.path)
+            .map_err(internal)?;
         Ok(layout::page(
             &query.path,
             &flash,
-            page(&snapshot, &query.path, &contents),
+            page(&snapshot, &query.path, &contents, estimate.as_ref()),
         ))
     })
     .await
 }
 
-fn page(snapshot: &Snapshot, path: &str, contents: &str) -> Markup {
+fn page(
+    snapshot: &Snapshot,
+    path: &str,
+    contents: &str,
+    estimate: Option<&RecordedEstimate>,
+) -> Markup {
     let source = &snapshot.source;
     let lines: Vec<&str> = contents.lines().collect();
     let sections = sections::split(contents);
@@ -92,6 +102,26 @@ fn page(snapshot: &Snapshot, path: &str, contents: &str) -> Markup {
         @if lines.is_empty() {
             p.empty { "This file is empty." }
         } @else {
+            form.inline method="post" action="/estimate" {
+                input type="hidden" name="source" value=(source.id);
+                input type="hidden" name="commit" value=(snapshot.commit);
+                input type="hidden" name="path" value=(path);
+                button type="submit" { "Distill" }
+                span.note {
+                    "Starts with an estimate: tokens are counted section by section, which "
+                    "is free, and the expected cost is shown before anything runs."
+                }
+            }
+            @if let Some(recorded) = estimate {
+                p.note {
+                    "Latest estimate: "
+                    a href=(estimates::href(recorded.id)) {
+                        (number(recorded.estimate.input_tokens)) " input tokens, "
+                        (dollars(recorded.estimate.input_cost_micros))
+                    }
+                    ", counted " (layout::utc(&recorded.created_at)) "."
+                }
+            }
             table.lines {
                 tbody {
                     @for (index, line) in lines.iter().enumerate() {

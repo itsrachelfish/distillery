@@ -9,6 +9,7 @@
 //! The MVP has no login, so every request has to come from this computer's
 //! own pages: see `guard`.
 
+mod estimates;
 mod files;
 mod jobs;
 mod layout;
@@ -56,6 +57,7 @@ pub fn run(config: &Config) -> db::Result<()> {
         .merge(sources::routes())
         .merge(jobs::routes())
         .merge(files::routes())
+        .merge(estimates::routes())
         .merge(usage::routes())
         .route("/style.css", get(style))
         .fallback(not_found)
@@ -217,7 +219,12 @@ fn failed(back: &str, error: impl Display) -> Redirect {
 }
 
 fn flash(back: &str, key: &str, message: &str) -> Redirect {
-    Redirect::to(&format!("{back}?{key}={}", layout::url_encode(message)))
+    // Pages such as a file's already have a query in their address.
+    let join = if back.contains('?') { '&' } else { '?' };
+    Redirect::to(&format!(
+        "{back}{join}{key}={}",
+        layout::url_encode(message)
+    ))
 }
 
 async fn style() -> impl IntoResponse {

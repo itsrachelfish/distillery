@@ -78,6 +78,7 @@ fn run_check(database: &Path, model: &config::Model) -> Result<u64, String> {
     let counted = api.count_tokens(&Prompt {
         system: None,
         user: "ping".to_owned(),
+        schema: None,
     });
     let call = ModelCall {
         provider: api.provider().to_owned(),
@@ -92,11 +93,16 @@ fn run_check(database: &Path, model: &config::Model) -> Result<u64, String> {
         cost_micros: 0,
         duration_ms: started.elapsed().as_millis() as i64,
         stop_reason: None,
-        error: counted.as_ref().err().cloned(),
+        error: counted.as_ref().err().map(|error| error.message.clone()),
+        http_status: counted
+            .as_ref()
+            .err()
+            .and_then(|error| error.status)
+            .map(i64::from),
     };
     let conn = db::open(database).map_err(|err| format!("Opening the database: {err}"))?;
     db::record_model_call(&conn, &call).map_err(|err| format!("Recording the call: {err}"))?;
-    counted
+    counted.map_err(|error| error.message)
 }
 
 fn page(model: &config::Model, usage: &Usage) -> Markup {
@@ -104,7 +110,7 @@ fn page(model: &config::Model, usage: &Usage) -> Markup {
         h1 { "Usage" }
         p.lead {
             "Every call to the model API is recorded here with its tokens and cost, failed "
-            "calls included."
+            "calls included. Rate-limited calls are failed calls the API answered with 429."
         }
 
         h2 { "Settings in use" }
@@ -176,6 +182,7 @@ fn totals(group: &str, rows: &[UsageTotal]) -> Markup {
                     th scope="col" { (group) }
                     th.number scope="col" { "Calls" }
                     th.number scope="col" { "Failed" }
+                    th.number scope="col" { "Rate limited" }
                     th.number scope="col" { "Tokens in" }
                     th.number scope="col" { "Tokens out" }
                     th.number scope="col" { "Cost" }
@@ -187,6 +194,7 @@ fn totals(group: &str, rows: &[UsageTotal]) -> Markup {
                         td { (row.group) }
                         td.number { (number(row.calls)) }
                         td.number { (number(row.failed)) }
+                        td.number { (number(row.rate_limited)) }
                         td.number { (number(row.input_tokens)) }
                         td.number { (number(row.output_tokens)) }
                         td.number { (dollars(row.cost_micros)) }
