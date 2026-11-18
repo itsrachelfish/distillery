@@ -18,7 +18,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema, as the steps that build it. Steps are only ever added at the
 /// end: released steps never change.
-const MIGRATIONS: [&str; 4] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
+const MIGRATIONS: [&str; 5] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
 
 const SCHEMA_V1: &str = "
 -- Git repositories added by users.
@@ -207,6 +207,25 @@ ALTER TABLE model_calls ADD COLUMN end_line INTEGER;
 CREATE INDEX model_calls_run ON model_calls (run_id);
 ";
 
+const SCHEMA_V5: &str = "
+-- Runs take several files, each started from its own estimate. The
+-- estimate_id column of runs is no longer written.
+ALTER TABLE run_files ADD COLUMN estimate_id INTEGER REFERENCES estimates (id);
+UPDATE run_files
+SET estimate_id = (SELECT estimate_id FROM runs WHERE runs.id = run_files.run_id);
+
+-- The wording of each prompt version that ran, for comparing versions.
+CREATE TABLE prompt_versions (
+    -- The hash of the prompt files together.
+    version TEXT PRIMARY KEY,
+    system TEXT NOT NULL,
+    schema TEXT NOT NULL,
+    retry TEXT NOT NULL,
+    -- UTC, as YYYY-MM-DD HH:MM:SS.
+    first_used_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+";
+
 /// Opens the database, creating it when the file is new and running the
 /// schema steps an older database is missing.
 pub fn open(path: &Path) -> Result<Connection> {
@@ -352,6 +371,8 @@ pub struct ModelCall {
     pub provider: String,
     pub model: String,
     pub operation: String,
+    /// Input tokens billed at the full price: those neither written to the
+    /// prompt cache nor read from it.
     pub input_tokens: i64,
     /// Everything billed as output, thinking included.
     pub output_tokens: i64,
@@ -413,7 +434,10 @@ pub struct UsageTotal {
     pub failed: i64,
     /// Failed calls the API turned away with a rate limit.
     pub rate_limited: i64,
+    /// Input tokens, cached ones included.
     pub input_tokens: i64,
+    /// Input tokens read from the prompt cache.
+    pub cached_tokens: i64,
     pub output_tokens: i64,
     /// The part of the output tokens spent on thinking.
     pub thinking_tokens: i64,
@@ -440,7 +464,8 @@ pub fn usage_totals(conn: &Connection, group: UsageGroup) -> Result<Vec<UsageTot
     let mut statement = conn.prepare(&format!(
         "SELECT {column}, count(*), sum(1 - success),
                 count(CASE WHEN http_status = 429 THEN 1 END),
-                sum(input_tokens), sum(output_tokens), sum(thinking_tokens),
+                sum(input_tokens + cache_write_tokens + cache_read_tokens),
+                sum(cache_read_tokens), sum(output_tokens), sum(thinking_tokens),
                 sum(cost_micros)
          FROM model_calls GROUP BY 1 ORDER BY {order}"
     ))?;
@@ -451,9 +476,10 @@ pub fn usage_totals(conn: &Connection, group: UsageGroup) -> Result<Vec<UsageTot
             failed: row.get(2)?,
             rate_limited: row.get(3)?,
             input_tokens: row.get(4)?,
-            output_tokens: row.get(5)?,
-            thinking_tokens: row.get(6)?,
-            cost_micros: row.get(7)?,
+            cached_tokens: row.get(5)?,
+            output_tokens: row.get(6)?,
+            thinking_tokens: row.get(7)?,
+            cost_micros: row.get(8)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -530,7 +556,9 @@ impl OutputRatio {
 /// Tokens added up over a model's successful calls for one operation.
 pub fn output_ratio(conn: &Connection, operation: &str, model: &str) -> Result<OutputRatio> {
     Ok(conn.query_row(
-        "SELECT count(*), coalesce(sum(input_tokens), 0), coalesce(sum(output_tokens), 0)
+        "SELECT count(*),
+                coalesce(sum(input_tokens + cache_write_tokens + cache_read_tokens), 0),
+                coalesce(sum(output_tokens), 0)
          FROM model_calls WHERE operation = ?1 AND model = ?2 AND success = 1",
         params![operation, model],
         |row| {
@@ -706,30 +734,40 @@ pub struct Run {
     pub provider: String,
     pub model: String,
     pub prompt_version: String,
-    /// The estimate the run starts from.
+}
+
+/// A file of a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunFile {
+    pub path: String,
+    /// The hash of the file's contents.
+    pub blob_hash: String,
+    /// The estimate the file was started from.
     pub estimate_id: Option<i64>,
 }
 
-/// Records a run as started, with its one file, and returns its ID.
-pub fn start_run(conn: &mut Connection, run: &Run, path: &str, blob_hash: &str) -> Result<i64> {
+/// Records a run as started, with its files, and returns its ID.
+pub fn start_run(conn: &mut Connection, run: &Run, files: &[RunFile]) -> Result<i64> {
     let transaction = conn.transaction()?;
     transaction.execute(
-        "INSERT INTO runs (source_id, commit_hash, provider, model, prompt_version, estimate_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO runs (source_id, commit_hash, provider, model, prompt_version)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
             run.source_id,
             run.commit_hash,
             run.provider,
             run.model,
-            run.prompt_version,
-            run.estimate_id
+            run.prompt_version
         ],
     )?;
     let id = transaction.last_insert_rowid();
-    transaction.execute(
-        "INSERT INTO run_files (run_id, path, blob_hash) VALUES (?1, ?2, ?3)",
-        params![id, path, blob_hash],
-    )?;
+    for file in files {
+        transaction.execute(
+            "INSERT INTO run_files (run_id, path, blob_hash, estimate_id)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, file.path, file.blob_hash, file.estimate_id],
+        )?;
+    }
     transaction.commit()?;
     Ok(id)
 }
@@ -759,7 +797,7 @@ pub fn find_run(conn: &Connection, id: i64) -> Result<Option<RecordedRun>> {
     Ok(conn
         .query_row(
             "SELECT id, started_at, outcome, source_id, commit_hash, provider, model,
-                    prompt_version, estimate_id
+                    prompt_version
              FROM runs WHERE id = ?1",
             params![id],
             |row| {
@@ -773,7 +811,6 @@ pub fn find_run(conn: &Connection, id: i64) -> Result<Option<RecordedRun>> {
                         provider: row.get(5)?,
                         model: row.get(6)?,
                         prompt_version: row.get(7)?,
-                        estimate_id: row.get(8)?,
                     },
                 })
             },
@@ -781,15 +818,19 @@ pub fn find_run(conn: &Connection, id: i64) -> Result<Option<RecordedRun>> {
         .optional()?)
 }
 
-/// The path and blob hash of a run's file. Runs have one file so far.
-pub fn run_file(conn: &Connection, run_id: i64) -> Result<Option<(String, String)>> {
-    Ok(conn
-        .query_row(
-            "SELECT path, blob_hash FROM run_files WHERE run_id = ?1 ORDER BY path LIMIT 1",
-            params![run_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()?)
+/// A run's files, sorted by path.
+pub fn run_files(conn: &Connection, run_id: i64) -> Result<Vec<RunFile>> {
+    let mut statement = conn.prepare(
+        "SELECT path, blob_hash, estimate_id FROM run_files WHERE run_id = ?1 ORDER BY path",
+    )?;
+    let rows = statement.query_map(params![run_id], |row| {
+        Ok(RunFile {
+            path: row.get(0)?,
+            blob_hash: row.get(1)?,
+            estimate_id: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// The ID of the latest run of a file at a commit, if it has one.
@@ -808,6 +849,125 @@ pub fn latest_run(
             |row| row.get(0),
         )
         .optional()?)
+}
+
+/// Keeps the wording of a prompt version, so runs can be compared with the
+/// prompts that produced them. Versions already kept stay as they are.
+pub fn record_prompt_version(
+    conn: &Connection,
+    version: &str,
+    system: &str,
+    schema: &str,
+    retry: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO prompt_versions (version, system, schema, retry)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![version, system, schema, retry],
+    )?;
+    Ok(())
+}
+
+/// The system prompt and retry prompt of a version, when they were kept.
+pub fn prompt_version(conn: &Connection, version: &str) -> Result<Option<(String, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT system, retry FROM prompt_versions WHERE version = ?1",
+            params![version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// What one prompt version and model produced and used, added up over
+/// sections: the numbers for comparing versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionStats {
+    pub prompt_version: String,
+    pub model: String,
+    /// UTC, when the version first recorded a section.
+    pub first_used: String,
+    /// Section results recorded, distilled or not.
+    pub results: i64,
+    pub distilled: i64,
+    /// Source lines in those sections.
+    pub lines: i64,
+    pub claims: i64,
+    /// Characters of claim text and of quotes, over all claims.
+    pub text_chars: i64,
+    pub quote_chars: i64,
+    pub calls: i64,
+    /// Input tokens, cached ones included.
+    pub input_tokens: i64,
+    /// Input tokens read from the prompt cache.
+    pub cached_tokens: i64,
+    pub output_tokens: i64,
+    pub thinking_tokens: i64,
+    pub cost_micros: i64,
+}
+
+/// Prompt versions compared, oldest first: over everything recorded, or
+/// over one file's contents when `blob_hash` is given, where versions read
+/// the same text.
+pub fn version_stats(conn: &Connection, blob_hash: Option<&str>) -> Result<Vec<VersionStats>> {
+    let mut statement = conn.prepare(
+        "WITH results AS (
+             SELECT prompt_version, model, min(created_at) AS first_used, count(*) AS results,
+                    sum(distilled) AS distilled, sum(end_line - start_line + 1) AS lines
+             FROM extractions WHERE ?1 IS NULL OR blob_hash = ?1 GROUP BY 1, 2
+         ), found AS (
+             SELECT extractions.prompt_version, extractions.model, count(*) AS claims,
+                    sum(length(claims.text)) AS text_chars,
+                    sum(length(spans.quote)) AS quote_chars
+             FROM extractions
+             JOIN claims ON claims.extraction_id = extractions.id
+             JOIN spans ON spans.id = claims.span_id
+             WHERE ?1 IS NULL OR extractions.blob_hash = ?1 GROUP BY 1, 2
+         ), used AS (
+             SELECT runs.prompt_version, runs.model, count(*) AS calls,
+                    sum(input_tokens + cache_write_tokens + cache_read_tokens) AS input_tokens,
+                    sum(cache_read_tokens) AS cached_tokens,
+                    sum(output_tokens) AS output_tokens,
+                    sum(thinking_tokens) AS thinking_tokens, sum(cost_micros) AS cost_micros
+             FROM model_calls JOIN runs ON runs.id = model_calls.run_id
+             WHERE ?1 IS NULL OR EXISTS (
+                 SELECT 1 FROM run_files
+                 WHERE run_files.run_id = model_calls.run_id
+                   AND run_files.path = model_calls.path AND run_files.blob_hash = ?1
+             )
+             GROUP BY 1, 2
+         )
+         SELECT results.prompt_version, results.model, results.first_used, results.results,
+                results.distilled, results.lines, coalesce(found.claims, 0),
+                coalesce(found.text_chars, 0), coalesce(found.quote_chars, 0),
+                coalesce(used.calls, 0), coalesce(used.input_tokens, 0),
+                coalesce(used.cached_tokens, 0), coalesce(used.output_tokens, 0),
+                coalesce(used.thinking_tokens, 0), coalesce(used.cost_micros, 0)
+         FROM results
+         LEFT JOIN found USING (prompt_version, model)
+         LEFT JOIN used USING (prompt_version, model)
+         ORDER BY results.first_used, results.prompt_version",
+    )?;
+    let rows = statement.query_map(params![blob_hash], |row| {
+        Ok(VersionStats {
+            prompt_version: row.get(0)?,
+            model: row.get(1)?,
+            first_used: row.get(2)?,
+            results: row.get(3)?,
+            distilled: row.get(4)?,
+            lines: row.get(5)?,
+            claims: row.get(6)?,
+            text_chars: row.get(7)?,
+            quote_chars: row.get(8)?,
+            calls: row.get(9)?,
+            input_tokens: row.get(10)?,
+            cached_tokens: row.get(11)?,
+            output_tokens: row.get(12)?,
+            thinking_tokens: row.get(13)?,
+            cost_micros: row.get(14)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// What identifies a section to the cache: the file's contents, the
@@ -899,6 +1059,8 @@ pub fn record_extraction(
 /// A section's result in a run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extraction {
+    /// The hash of the file's contents.
+    pub blob_hash: String,
     pub start_line: i64,
     pub end_line: i64,
     pub distilled: bool,
@@ -911,8 +1073,8 @@ pub struct Extraction {
 pub fn run_extractions(conn: &Connection, run_id: i64) -> Result<Vec<Extraction>> {
     let mut statement = conn.prepare(
         "SELECT start_line, end_line, distilled, reason, reply,
-                (SELECT count(*) FROM claims WHERE extraction_id = extractions.id)
-         FROM extractions WHERE run_id = ?1 ORDER BY start_line, id",
+                (SELECT count(*) FROM claims WHERE extraction_id = extractions.id), blob_hash
+         FROM extractions WHERE run_id = ?1 ORDER BY id",
     )?;
     let rows = statement.query_map(params![run_id], |row| {
         Ok(Extraction {
@@ -922,41 +1084,50 @@ pub fn run_extractions(conn: &Connection, run_id: i64) -> Result<Vec<Extraction>
             reason: row.get(3)?,
             reply: row.get(4)?,
             claims: row.get(5)?,
+            blob_hash: row.get(6)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 /// What a run's calls for one section used, added up.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SectionUsage {
+    pub path: String,
     pub start_line: i64,
     pub end_line: i64,
     pub calls: i64,
     pub failed: i64,
+    /// Input tokens, cached ones included.
     pub input_tokens: i64,
+    /// Input tokens read from the prompt cache.
+    pub cached_tokens: i64,
     pub output_tokens: i64,
     pub thinking_tokens: i64,
     pub cost_micros: i64,
 }
 
-/// A run's usage by section, in file order.
+/// A run's usage by file and section.
 pub fn run_usage(conn: &Connection, run_id: i64) -> Result<Vec<SectionUsage>> {
     let mut statement = conn.prepare(
-        "SELECT start_line, end_line, count(*), sum(1 - success), sum(input_tokens),
-                sum(output_tokens), sum(thinking_tokens), sum(cost_micros)
-         FROM model_calls WHERE run_id = ?1 GROUP BY start_line, end_line ORDER BY start_line",
+        "SELECT path, start_line, end_line, count(*), sum(1 - success),
+                sum(input_tokens + cache_write_tokens + cache_read_tokens),
+                sum(cache_read_tokens), sum(output_tokens), sum(thinking_tokens),
+                sum(cost_micros)
+         FROM model_calls WHERE run_id = ?1 GROUP BY path, start_line, end_line",
     )?;
     let rows = statement.query_map(params![run_id], |row| {
         Ok(SectionUsage {
-            start_line: row.get(0)?,
-            end_line: row.get(1)?,
-            calls: row.get(2)?,
-            failed: row.get(3)?,
-            input_tokens: row.get(4)?,
-            output_tokens: row.get(5)?,
-            thinking_tokens: row.get(6)?,
-            cost_micros: row.get(7)?,
+            path: row.get(0)?,
+            start_line: row.get(1)?,
+            end_line: row.get(2)?,
+            calls: row.get(3)?,
+            failed: row.get(4)?,
+            input_tokens: row.get(5)?,
+            cached_tokens: row.get(6)?,
+            output_tokens: row.get(7)?,
+            thinking_tokens: row.get(8)?,
+            cost_micros: row.get(9)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

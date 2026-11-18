@@ -1,6 +1,6 @@
 //! The Sources page, with every repository added and its latest snapshot,
 //! and the Source page, with one repository's recorded commits and the
-//! Markdown files at one of them.
+//! Markdown files at one of them, where files are selected for distilling.
 
 use std::path::{Path, PathBuf};
 
@@ -131,13 +131,33 @@ fn source(snapshot: &Snapshot) -> Markup {
         @if snapshot.files.is_empty() {
             p.empty { "No Markdown files at this commit." }
         } @else {
-            ul.files {
-                @for path in &snapshot.files {
-                    li { a href=(files::href(source.id, &snapshot.commit, path)) { (path) } }
+            form method="post" action="/estimate" {
+                input type="hidden" name="source" value=(source.id);
+                input type="hidden" name="commit" value=(snapshot.commit);
+                ul.files {
+                    @for path in &snapshot.files {
+                        li {
+                            label {
+                                input type="checkbox" name="path" value=(path);
+                                " "
+                            }
+                            a href=(files::href(source.id, &snapshot.commit, path)) { (path) }
+                        }
+                    }
                 }
-            }
-            p.note {
-                (counted(snapshot.files.len() as u64, "Markdown file", "Markdown files"))
+                p.inline {
+                    button type="submit" { "Distill selected" }
+                    " "
+                    button type="submit" name="all" value="1" {
+                        "Distill all "
+                        (counted(snapshot.files.len() as u64, "Markdown file", "Markdown files"))
+                    }
+                }
+                p.note {
+                    "Starts with an estimate: tokens are counted section by section, which is "
+                    "free, and the expected cost is shown before anything runs. Files with a "
+                    "current estimate aren't counted again."
+                }
             }
         }
 

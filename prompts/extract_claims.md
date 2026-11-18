@@ -14,7 +14,7 @@ Each message holds the file path, the heading path of the section, and the secti
 
 - **Copied exactly** from the section, character for character, including Markdown markup.
 - **One unbroken passage.** No ellipses, and no joining of separate passages.
-- **As short as supports the claim:** a sentence, a table row, a list item or a line of code.
+- **The fewest words that support the claim:** a clause or a phrase is enough. Whole sentences only when the claim needs every part. Claims from one sentence quote their own parts of it.
 
 ## Kinds
 

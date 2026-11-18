@@ -26,6 +26,8 @@ pub struct Anthropic {
     model: String,
     /// The most output tokens one call may use, thinking included.
     max_output_tokens: u32,
+    /// Whether model calls ask for the system prompt to be cached.
+    prompt_caching: bool,
 }
 
 impl Anthropic {
@@ -44,6 +46,7 @@ impl Anthropic {
             key: model.api_key.clone(),
             model: model.name.clone(),
             max_output_tokens: model.max_output_tokens,
+            prompt_caching: model.prompt_caching,
         })
     }
 
@@ -128,6 +131,17 @@ impl ModelProvider for Anthropic {
     fn reply(&self, prompt: &Prompt) -> Result<Reply, ModelError> {
         let mut body = self.request(prompt);
         body["max_tokens"] = json!(self.max_output_tokens);
+        if let (true, Some(system)) = (self.prompt_caching, &prompt.system) {
+            // The system prompt is the same for every section of a run, so
+            // the API can cache it: later calls read it at the cache price.
+            // Prompts shorter than the model's minimum go uncached, without
+            // an error.
+            body["system"] = json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": { "type": "ephemeral" },
+            }]);
+        }
         let reply = self.post("/v1/messages", &body)?;
         read_reply(&reply).ok_or_else(|| ModelError {
             status: Some(200),

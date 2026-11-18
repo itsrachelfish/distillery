@@ -52,6 +52,16 @@ pub struct Model {
     /// US dollars per million output tokens.
     #[serde(default = "default_output_price")]
     pub output_price: f64,
+    /// Whether runs ask the API to cache the prompt repeated with every
+    /// section.
+    #[serde(default = "default_prompt_caching")]
+    pub prompt_caching: bool,
+    /// US dollars per million input tokens written to the prompt cache.
+    #[serde(default = "default_cache_write_price")]
+    pub cache_write_price: f64,
+    /// US dollars per million input tokens read from the prompt cache.
+    #[serde(default = "default_cache_read_price")]
+    pub cache_read_price: f64,
     /// Runs stop once their recorded cost passes this many US dollars.
     #[serde(default = "default_max_run_cost")]
     pub max_run_cost: f64,
@@ -71,6 +81,21 @@ impl Model {
     /// The cost of output tokens, in millionths of a US dollar.
     pub fn output_cost_micros(&self, tokens: i64) -> i64 {
         (tokens as f64 * self.output_price).round() as i64
+    }
+
+    /// The cost of one call, in millionths of a US dollar. `input` tokens
+    /// are those billed at the full price; tokens written to the prompt
+    /// cache and read from it have prices of their own.
+    pub fn call_cost_micros(
+        &self,
+        input: i64,
+        cache_write: i64,
+        cache_read: i64,
+        output: i64,
+    ) -> i64 {
+        let cached =
+            cache_write as f64 * self.cache_write_price + cache_read as f64 * self.cache_read_price;
+        self.input_cost_micros(input) + cached.round() as i64 + self.output_cost_micros(output)
     }
 
     /// The run cost limit, in millionths of a US dollar.
@@ -107,6 +132,18 @@ fn default_output_price() -> f64 {
     20.0
 }
 
+fn default_prompt_caching() -> bool {
+    true
+}
+
+fn default_cache_write_price() -> f64 {
+    5.00
+}
+
+fn default_cache_read_price() -> f64 {
+    0.20
+}
+
 fn default_max_output_tokens() -> u32 {
     8192
 }
@@ -138,6 +175,9 @@ impl Default for Model {
             api_key: String::new(),
             input_price: default_input_price(),
             output_price: default_output_price(),
+            prompt_caching: default_prompt_caching(),
+            cache_write_price: default_cache_write_price(),
+            cache_read_price: default_cache_read_price(),
             max_run_cost: default_max_run_cost(),
             max_output_tokens: default_max_output_tokens(),
         }
@@ -210,6 +250,8 @@ impl Config {
         for (setting, amount) in [
             ("model.input_price", self.model.input_price),
             ("model.output_price", self.model.output_price),
+            ("model.cache_write_price", self.model.cache_write_price),
+            ("model.cache_read_price", self.model.cache_read_price),
             ("model.max_run_cost", self.model.max_run_cost),
         ] {
             if !amount.is_finite() || amount < 0.0 {

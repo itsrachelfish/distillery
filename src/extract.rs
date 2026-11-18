@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use serde_json::Value;
 
 use crate::config;
-use crate::db::{self, CallSection, Claim, ModelCall, SectionKey};
+use crate::db::{self, CallSection, Claim, ModelCall, RunFile, SectionKey};
 use crate::estimate::heading_only;
 use crate::model::{self, ModelError, ModelProvider, Prompt, Reply};
 use crate::progress::{Progress, counted};
@@ -33,14 +33,14 @@ const KINDS: [&str; 6] = [
 /// How much of a rejected quote a problem repeats.
 const QUOTED: usize = 120;
 
-/// A Markdown file at a recorded commit.
+/// A Markdown file at the run's commit.
 pub struct File<'a> {
-    pub source_id: i64,
-    pub commit: &'a str,
     pub path: &'a str,
     /// The hash of the file's contents, which the cache goes by.
     pub blob_hash: &'a str,
     pub contents: &'a str,
+    /// The estimate the file is started from.
+    pub estimate_id: Option<i64>,
 }
 
 /// What a run did.
@@ -60,33 +60,44 @@ pub struct Ran {
     pub cost_micros: i64,
 }
 
-/// Runs pass 1 over a file and records the run. `settings` hold the prices
-/// and the cost limit. `estimate_id` is the estimate the run starts from.
+/// Runs pass 1 over files of one source at one commit and records the run.
+/// `settings` hold the prices and the cost limit.
 pub fn run(
     conn: &mut Connection,
     provider: &dyn ModelProvider,
     settings: &config::Model,
-    file: &File,
-    estimate_id: Option<i64>,
+    source_id: i64,
+    commit: &str,
+    files: &[File],
     progress: &mut Progress,
 ) -> Result<Ran, String> {
     let extraction = Extraction::load()?;
+    let (system, schema, retry) = extraction.wording();
+    db::record_prompt_version(conn, &extraction.version, system, schema, retry)
+        .map_err(|err| format!("Recording the prompt version: {err}"))?;
     let run = db::Run {
-        source_id: file.source_id,
-        commit_hash: file.commit.to_owned(),
+        source_id,
+        commit_hash: commit.to_owned(),
         provider: provider.provider().to_owned(),
         model: provider.model().to_owned(),
         prompt_version: extraction.version.clone(),
-        estimate_id,
     };
-    let run_id = db::start_run(conn, &run, file.path, file.blob_hash)
-        .map_err(|err| format!("Recording the run: {err}"))?;
+    let run_files: Vec<RunFile> = files
+        .iter()
+        .map(|file| RunFile {
+            path: file.path.to_owned(),
+            blob_hash: file.blob_hash.to_owned(),
+            estimate_id: file.estimate_id,
+        })
+        .collect();
+    let run_id =
+        db::start_run(conn, &run, &run_files).map_err(|err| format!("Recording the run: {err}"))?;
 
     let result = distill(
         conn,
         provider,
         settings,
-        file,
+        files,
         &extraction,
         run_id,
         progress,
@@ -103,11 +114,34 @@ pub fn run(
     result
 }
 
+/// What identifies a section to the cache.
+fn section_key<'a>(
+    file: &File<'a>,
+    section: &Section,
+    prompt_version: &'a str,
+    model: &'a str,
+) -> SectionKey<'a> {
+    SectionKey {
+        blob_hash: file.blob_hash,
+        start_line: section.start_line as i64,
+        end_line: section.end_line as i64,
+        prompt_version,
+        model,
+    }
+}
+
+/// A section waiting to be sent, with its file and the file's lines.
+struct Waiting<'a> {
+    file: &'a File<'a>,
+    section: Section,
+    lines: &'a [&'a str],
+}
+
 fn distill(
     conn: &mut Connection,
     provider: &dyn ModelProvider,
     settings: &config::Model,
-    file: &File,
+    files: &[File],
     extraction: &Extraction,
     run_id: i64,
     progress: &mut Progress,
@@ -116,25 +150,31 @@ fn distill(
         run_id,
         ..Ran::default()
     };
-    let lines: Vec<&str> = file.contents.lines().collect();
-    let all = sections::split(file.contents);
-    let key = |section: &Section| SectionKey {
-        blob_hash: file.blob_hash,
-        start_line: section.start_line as i64,
-        end_line: section.end_line as i64,
-        prompt_version: &extraction.version,
-        model: provider.model(),
-    };
+    let (version, model) = (extraction.version.as_str(), provider.model());
+    let lines: Vec<Vec<&str>> = files
+        .iter()
+        .map(|file| file.contents.lines().collect())
+        .collect();
 
-    progress.stage("Checking the cache", 0, "sections");
+    progress.stage("Checking the cache", files.len() as u64, "files");
     let mut to_send = Vec::new();
-    for section in all.iter().filter(|section| !heading_only(section)) {
-        let cached = db::cached_extraction(conn, &key(section))
-            .map_err(|err| format!("Reading the cache: {err}"))?;
-        if cached.is_some() {
-            ran.cached += 1;
-        } else {
-            to_send.push(section);
+    for (index, file) in files.iter().enumerate() {
+        progress.update(index as u64, || file.path.to_owned());
+        for section in sections::split(file.contents) {
+            if heading_only(&section) {
+                continue;
+            }
+            let cached = db::cached_extraction(conn, &section_key(file, &section, version, model))
+                .map_err(|err| format!("Reading the cache: {err}"))?;
+            if cached.is_some() {
+                ran.cached += 1;
+            } else {
+                to_send.push(Waiting {
+                    file,
+                    lines: &lines[index][section.start_line - 1..section.end_line],
+                    section,
+                });
+            }
         }
     }
     progress.done(&format!(
@@ -145,14 +185,18 @@ fn distill(
 
     progress.stage("Extracting claims", to_send.len() as u64, "sections");
     let limit = settings.max_run_cost_micros();
-    for (index, section) in to_send.iter().enumerate() {
+    for (index, waiting) in to_send.iter().enumerate() {
         if ran.cost_micros > limit {
             ran.unsent = to_send.len() - index;
             break;
         }
-        let section_lines = &lines[section.start_line - 1..section.end_line];
+        let Waiting {
+            file,
+            section,
+            lines,
+        } = waiting;
         // Sections are sent as written.
-        let text = section_lines.join("\n");
+        let text = lines.join("\n");
         let title = section.title();
         let call = Call {
             provider,
@@ -169,12 +213,12 @@ fn distill(
 
         let prompt = extraction.prompt(file.path, &title, &text);
         let first = call.send(conn, &prompt, &mut ran.cost_micros, progress)?;
-        let mut judged = judge(first, section_lines, section.start_line);
+        let mut judged = judge(first, lines, section.start_line);
         if let Judged::Problems(problems, _) = &judged {
             // Rejected claims go back to the model once, with the reasons.
             let prompt = extraction.retry(file.path, &title, &text, problems);
             let second = call.send(conn, &prompt, &mut ran.cost_micros, progress)?;
-            judged = judge(second, section_lines, section.start_line);
+            judged = judge(second, lines, section.start_line);
         }
 
         let (claims, reason, reply) = match judged {
@@ -185,7 +229,7 @@ fn distill(
         db::record_extraction(
             conn,
             run_id,
-            &key(section),
+            &section_key(file, section, version, model),
             &claims,
             reason.as_deref(),
             &reply,
@@ -254,6 +298,10 @@ impl Call<'_> {
     fn record(&self, took: Duration, reply: Result<&Reply, &ModelError>) -> ModelCall {
         let usage = reply.map(|reply| reply.usage).unwrap_or_default();
         let (input, output) = (usage.input_tokens as i64, usage.output_tokens as i64);
+        let (cache_write, cache_read) = (
+            usage.cache_write_tokens as i64,
+            usage.cache_read_tokens as i64,
+        );
         ModelCall {
             provider: self.provider.provider().to_owned(),
             model: self.provider.model().to_owned(),
@@ -261,10 +309,11 @@ impl Call<'_> {
             input_tokens: input,
             output_tokens: output,
             thinking_tokens: usage.thinking_tokens as i64,
-            cache_write_tokens: usage.cache_write_tokens as i64,
-            cache_read_tokens: usage.cache_read_tokens as i64,
-            cost_micros: self.settings.input_cost_micros(input)
-                + self.settings.output_cost_micros(output),
+            cache_write_tokens: cache_write,
+            cache_read_tokens: cache_read,
+            cost_micros: self
+                .settings
+                .call_cost_micros(input, cache_write, cache_read, output),
             duration_ms: took.as_millis() as i64,
             stop_reason: reply.ok().map(|reply| reply.stop_reason.clone()),
             error: reply.err().map(|error| error.message.clone()),

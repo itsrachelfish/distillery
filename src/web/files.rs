@@ -12,8 +12,8 @@ use serde::Deserialize;
 
 use super::layout::{self, dollars, number};
 use super::sources::{self as source_pages, Snapshot};
-use super::{App, Flash, PageError, PageResult, estimates, internal, runs, with_db};
-use crate::db::{self, RecordedEstimate, ShownClaim};
+use super::{App, Flash, PageError, PageResult, estimates, internal, runs, usage, with_db};
+use crate::db::{self, RecordedEstimate, ShownClaim, VersionStats};
 use crate::git;
 use crate::progress::counted;
 use crate::sections::{self, Section};
@@ -64,6 +64,7 @@ async fn file_page(
         let blob_hash = git::blob_at(&snapshot.clone, &snapshot.commit, &query.path)
             .map_err(PageError::internal)?;
         let claims = db::claims_of_blob(conn, &blob_hash).map_err(internal)?;
+        let versions = db::version_stats(conn, Some(&blob_hash)).map_err(internal)?;
         let view = View {
             snapshot: &snapshot,
             path: &query.path,
@@ -71,6 +72,7 @@ async fn file_page(
             estimate: estimate.as_ref(),
             run,
             claims: &claims,
+            versions: &versions,
         };
         Ok(layout::page(&query.path, &flash, page(&view)))
     })
@@ -88,6 +90,8 @@ struct View<'a> {
     run: Option<i64>,
     /// The claims extracted from the file's contents.
     claims: &'a [ShownClaim],
+    /// The prompt versions that read the file's contents, compared.
+    versions: &'a [VersionStats],
 }
 
 fn page(view: &View) -> Markup {
@@ -194,6 +198,15 @@ fn page(view: &View) -> Markup {
                         }
                     }
                 }
+            }
+            @if !view.versions.is_empty() {
+                h2 { "Prompt versions compared" }
+                p.note {
+                    "Every prompt version that read this file's contents, so the numbers "
+                    "compare the same text. Claims shown above come from each section's "
+                    "latest run."
+                }
+                (usage::versions(view.versions))
             }
         }
     }

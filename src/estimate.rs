@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use crate::config;
 use crate::db::{self, Estimate, EstimateSection, ModelCall};
 use crate::model::{self, ModelError, ModelProvider, Prompt};
-use crate::progress::{Progress, counted, thousands};
+use crate::progress::{Progress, counted};
 use crate::prompts::{self, Extraction};
 use crate::sections::{self, Section};
 
@@ -36,81 +36,111 @@ pub struct Estimated {
     pub estimate: Estimate,
 }
 
-/// Counts the tokens of every section of a file and records the estimate.
-/// `prices` are the model settings the costs come from.
+/// What counting several files gave.
+pub struct Counted {
+    /// One estimate per file with text to distill, in the order given.
+    pub estimates: Vec<Estimated>,
+    /// The paths of files without text to distill, which get no estimate.
+    pub empty: Vec<String>,
+}
+
+/// Counts the tokens of every section of the files and records one estimate
+/// per file. `prices` are the model settings the costs come from.
 pub fn run(
     conn: &mut Connection,
     provider: &dyn ModelProvider,
     prices: &config::Model,
-    file: &File,
+    files: &[File],
     progress: &mut Progress,
-) -> Result<Estimated, String> {
-    progress.stage("Cutting sections", 0, "sections");
-    let lines: Vec<&str> = file.contents.lines().collect();
-    let all = sections::split(file.contents);
-    let (skipped, to_send): (Vec<&Section>, Vec<&Section>) =
-        all.iter().partition(|section| heading_only(section));
+) -> Result<Counted, String> {
+    progress.stage("Cutting sections", files.len() as u64, "files");
+    let mut cut = Vec::new();
+    let mut empty = Vec::new();
+    let mut total = 0;
+    for (index, file) in files.iter().enumerate() {
+        progress.update(index as u64, || file.path.to_owned());
+        let all = sections::split(file.contents);
+        let (skipped, to_send): (Vec<Section>, Vec<Section>) =
+            all.into_iter().partition(heading_only);
+        if to_send.is_empty() {
+            empty.push(file.path.to_owned());
+        } else {
+            total += to_send.len();
+            cut.push((file, skipped.len(), to_send));
+        }
+    }
     progress.done(&format!(
-        "{}, {} to send",
-        counted(all.len() as u64, "section", "sections"),
-        thousands(to_send.len() as u64)
+        "{} to send in {}",
+        counted(total as u64, "section", "sections"),
+        counted(cut.len() as u64, "file", "files")
     ));
-    if to_send.is_empty() {
-        return Err(format!("{} has no text to distill.", file.path));
+    if cut.is_empty() {
+        return Err("The files have no text to distill.".to_owned());
     }
 
     let extraction = Extraction::load()?;
-    progress.stage("Counting tokens", to_send.len() as u64, "sections");
-    let mut sections = Vec::with_capacity(to_send.len());
-    for (index, section) in to_send.iter().enumerate() {
-        // Sections are sent as written.
-        let text = lines[section.start_line - 1..section.end_line].join("\n");
-        let prompt = extraction.prompt(file.path, &section.title(), &text);
-        let place = format!(
-            "{} lines {}–{}",
-            file.path, section.start_line, section.end_line
-        );
-        progress.update(index as u64, || place.clone());
-        let input_tokens = count(conn, provider, &prompt, index as u64, &place, progress)?;
-        sections.push(EstimateSection {
-            start_line: section.start_line as i64,
-            end_line: section.end_line as i64,
-            input_tokens,
-        });
-    }
-    let input_tokens: i64 = sections.iter().map(|section| section.input_tokens).sum();
-    progress.done(&format!(
-        "{} in {}",
-        counted(input_tokens as u64, "input token", "input tokens"),
-        counted(sections.len() as u64, "call", "calls")
-    ));
-
     // Output can't be counted in advance. It is expected from what the
     // model's earlier extraction calls returned for their input.
     let ratio = db::output_ratio(conn, prompts::EXTRACT_OPERATION, provider.model())
         .map_err(|err| format!("Reading earlier calls: {err}"))?;
-    let output_tokens = ratio.output_for(input_tokens);
-    let estimate = Estimate {
-        source_id: file.source_id,
-        commit_hash: file.commit.to_owned(),
-        path: file.path.to_owned(),
-        provider: provider.provider().to_owned(),
-        model: provider.model().to_owned(),
-        prompt_version: extraction.version,
-        skipped_sections: skipped.len() as i64,
-        input_tokens,
-        input_cost_micros: prices.input_cost_micros(input_tokens),
-        output_tokens,
-        output_cost_micros: output_tokens.map(|tokens| prices.output_cost_micros(tokens)),
-        ratio_calls: ratio.calls,
-    };
-    let id = db::record_estimate(conn, &estimate, &sections)
-        .map_err(|err| format!("Recording the estimate: {err}"))?;
-    Ok(Estimated {
-        id,
-        sections: sections.len(),
-        estimate,
-    })
+
+    progress.stage("Counting tokens", total as u64, "sections");
+    let mut estimates = Vec::with_capacity(cut.len());
+    let mut done = 0;
+    let mut all_tokens = 0;
+    for (file, skipped, to_send) in cut {
+        let lines: Vec<&str> = file.contents.lines().collect();
+        let mut sections = Vec::with_capacity(to_send.len());
+        for section in &to_send {
+            // Sections are sent as written.
+            let text = lines[section.start_line - 1..section.end_line].join("\n");
+            let prompt = extraction.prompt(file.path, &section.title(), &text);
+            let place = format!(
+                "{} lines {}–{}",
+                file.path, section.start_line, section.end_line
+            );
+            progress.update(done, || place.clone());
+            let input_tokens = count(conn, provider, &prompt, done, &place, progress)?;
+            done += 1;
+            sections.push(EstimateSection {
+                start_line: section.start_line as i64,
+                end_line: section.end_line as i64,
+                input_tokens,
+            });
+        }
+        let input_tokens: i64 = sections.iter().map(|section| section.input_tokens).sum();
+        all_tokens += input_tokens;
+        let output_tokens = ratio.output_for(input_tokens);
+        let estimate = Estimate {
+            source_id: file.source_id,
+            commit_hash: file.commit.to_owned(),
+            path: file.path.to_owned(),
+            provider: provider.provider().to_owned(),
+            model: provider.model().to_owned(),
+            prompt_version: extraction.version.clone(),
+            skipped_sections: skipped as i64,
+            input_tokens,
+            input_cost_micros: prices.input_cost_micros(input_tokens),
+            output_tokens,
+            output_cost_micros: output_tokens.map(|tokens| prices.output_cost_micros(tokens)),
+            ratio_calls: ratio.calls,
+        };
+        // Each file's estimate is recorded as soon as it is counted, so a
+        // failure further on keeps the files before it.
+        let id = db::record_estimate(conn, &estimate, &sections)
+            .map_err(|err| format!("Recording the estimate: {err}"))?;
+        estimates.push(Estimated {
+            id,
+            sections: sections.len(),
+            estimate,
+        });
+    }
+    progress.done(&format!(
+        "{} in {}",
+        counted(all_tokens as u64, "input token", "input tokens"),
+        counted(done, "call", "calls")
+    ));
+    Ok(Counted { estimates, empty })
 }
 
 /// Whether a section holds a one-line heading and nothing under it, so no

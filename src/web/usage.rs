@@ -15,7 +15,7 @@ use super::layout::{self, dollars, number};
 use super::{App, Flash, PageResult, done, failed, internal, runs, with_db};
 use crate::anthropic::Anthropic;
 use crate::config;
-use crate::db::{self, ModelCall, RecordedCall, UsageGroup, UsageTotal};
+use crate::db::{self, ModelCall, RecordedCall, UsageGroup, UsageTotal, VersionStats};
 use crate::model::{ModelProvider, Prompt};
 
 /// How many of the latest calls the page lists.
@@ -29,6 +29,9 @@ pub(super) fn routes() -> Router<App> {
 
 /// What the page shows.
 struct Usage {
+    /// Prompt versions compared, each with its wording when it was kept.
+    versions: Vec<VersionStats>,
+    wording: Vec<(String, String, String)>,
     by_model: Vec<UsageTotal>,
     by_operation: Vec<UsageTotal>,
     by_day: Vec<UsageTotal>,
@@ -38,7 +41,21 @@ struct Usage {
 async fn usage_page(State(app): State<App>, Query(flash): Query<Flash>) -> PageResult {
     let model = app.model.clone();
     with_db(&app, move |conn| {
+        let versions = db::version_stats(conn, None).map_err(internal)?;
+        let mut wording = Vec::new();
+        for row in &versions {
+            let kept = db::prompt_version(conn, &row.prompt_version).map_err(internal)?;
+            if let Some((system, retry)) = kept
+                && !wording
+                    .iter()
+                    .any(|(version, _, _)| version == &row.prompt_version)
+            {
+                wording.push((row.prompt_version.clone(), system, retry));
+            }
+        }
         let usage = Usage {
+            versions,
+            wording,
             by_model: db::usage_totals(conn, UsageGroup::Model).map_err(internal)?,
             by_operation: db::usage_totals(conn, UsageGroup::Operation).map_err(internal)?,
             by_day: db::usage_totals(conn, UsageGroup::Day).map_err(internal)?,
@@ -114,7 +131,8 @@ fn page(model: &config::Model, usage: &Usage) -> Markup {
             "Every call to the model API is recorded here with its tokens and cost, failed "
             "calls included. Rate-limited calls are failed calls the API answered with 429. "
             "Thinking tokens are the part of the output tokens the model spent thinking, "
-            "billed as output."
+            "billed as output. Tokens in include those read from the prompt cache, which "
+            "are billed at the cache price."
         }
 
         h2 { "Settings in use" }
@@ -131,6 +149,17 @@ fn page(model: &config::Model, usage: &Usage) -> Markup {
                 tr {
                     th scope="row" { "Output price" }
                     td { (price(model.output_price)) " per million tokens" }
+                }
+                tr {
+                    th scope="row" { "Prompt caching" }
+                    td {
+                        @if model.prompt_caching {
+                            "On · " (price(model.cache_write_price)) " per million tokens "
+                            "written, " (price(model.cache_read_price)) " read"
+                        } @else {
+                            "Off"
+                        }
+                    }
                 }
                 tr {
                     th scope="row" { "Run cost limit" }
@@ -161,6 +190,16 @@ fn page(model: &config::Model, usage: &Usage) -> Markup {
         @if usage.latest.is_empty() {
             p.empty { "No calls recorded yet." }
         } @else {
+            @if !usage.versions.is_empty() {
+                h2 { "By prompt version" }
+                (versions(&usage.versions))
+                @for (version, system, retry) in &usage.wording {
+                    details {
+                        summary.note { "Wording of prompt version " (layout::commit(version)) }
+                        pre.reply { (system) "\n\n" (retry) }
+                    }
+                }
+            }
             h2 { "By model" }
             (totals("Model", &usage.by_model))
             h2 { "By operation" }
@@ -188,6 +227,7 @@ fn totals(group: &str, rows: &[UsageTotal]) -> Markup {
                     th.number scope="col" { "Failed" }
                     th.number scope="col" { "Rate limited" }
                     th.number scope="col" { "Tokens in" }
+                    th.number scope="col" { "From cache" }
                     th.number scope="col" { "Tokens out" }
                     th.number scope="col" { "Thinking" }
                     th.number scope="col" { "Cost" }
@@ -201,6 +241,7 @@ fn totals(group: &str, rows: &[UsageTotal]) -> Markup {
                         td.number { (number(row.failed)) }
                         td.number { (number(row.rate_limited)) }
                         td.number { (number(row.input_tokens)) }
+                        td.number { (number(row.cached_tokens)) }
                         td.number { (number(row.output_tokens)) }
                         td.number { (number(row.thinking_tokens)) }
                         td.number { (dollars(row.cost_micros)) }
@@ -252,7 +293,10 @@ fn latest(rows: &[RecordedCall]) -> Markup {
                             number(call.cache_write_tokens),
                             number(call.cache_read_tokens)
                         )) {
-                            (number(call.input_tokens))
+                            (number(
+                                call.input_tokens + call.cache_write_tokens
+                                    + call.cache_read_tokens
+                            ))
                         }
                         td.number { (number(call.output_tokens)) }
                         td.number { (number(call.thinking_tokens)) }
@@ -263,6 +307,105 @@ fn latest(rows: &[RecordedCall]) -> Markup {
                                 (Some(error), _) => span.failed { "Failed: " (error) },
                                 (None, Some(reason)) => { "OK, " (reason) },
                                 (None, None) => "OK",
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A ratio with one decimal, such as claims per 100 lines. A dash when
+/// there is nothing to divide by.
+fn per(amount: f64, of: i64) -> String {
+    if of == 0 {
+        "–".to_owned()
+    } else {
+        format!("{:.1}", amount / of as f64)
+    }
+}
+
+/// Prompt versions side by side: what each produced, what it used, and what
+/// it cost, with the ratios that compare versions run over different
+/// amounts of text.
+pub(super) fn versions(rows: &[VersionStats]) -> Markup {
+    html! {
+        table {
+            caption.note {
+                "One row per prompt version and model, oldest first. Sections count every "
+                "result recorded. Review outcomes join these numbers once claims are "
+                "reviewed."
+            }
+            thead {
+                tr {
+                    th scope="col" { "Prompt version" }
+                    th.number scope="col" { "Sections" }
+                    th.number scope="col" { "Calls" }
+                    th.number scope="col" { "Claims" }
+                    th.number scope="col" { "Quote length" }
+                    th.number scope="col" { "Tokens in" }
+                    th.number scope="col" { "Tokens out" }
+                    th.number scope="col" { "Cost" }
+                }
+            }
+            tbody {
+                @for row in rows {
+                    tr {
+                        td {
+                            (layout::commit(&row.prompt_version))
+                            br;
+                            span.note { (row.model) " · " (layout::utc(&row.first_used)) }
+                        }
+                        td.number {
+                            (number(row.results))
+                            br;
+                            span.note { (number(row.results - row.distilled)) " not distilled" }
+                        }
+                        td.number {
+                            (number(row.calls))
+                            br;
+                            span.note { (per(row.calls as f64, row.results)) " per section" }
+                        }
+                        td.number {
+                            (number(row.claims))
+                            br;
+                            span.note {
+                                (per(row.claims as f64 * 100.0, row.lines)) " per 100 lines"
+                            }
+                        }
+                        td.number {
+                            (per(row.quote_chars as f64, row.claims))
+                            br;
+                            span.note {
+                                "characters per claim · text "
+                                (per(row.text_chars as f64, row.claims))
+                            }
+                        }
+                        td.number {
+                            (number(row.input_tokens))
+                            br;
+                            span.note {
+                                (per(row.cached_tokens as f64 * 100.0, row.input_tokens))
+                                "% from cache"
+                            }
+                        }
+                        td.number {
+                            (number(row.output_tokens))
+                            br;
+                            span.note {
+                                (per(row.output_tokens as f64, row.claims)) " per claim · "
+                                (number(row.thinking_tokens)) " thinking"
+                            }
+                        }
+                        td.number {
+                            (dollars(row.cost_micros))
+                            br;
+                            span.note {
+                                (dollars((row.cost_micros as f64 * 100.0
+                                    / row.lines.max(1) as f64)
+                                    .round() as i64))
+                                " per 100 lines"
                             }
                         }
                     }

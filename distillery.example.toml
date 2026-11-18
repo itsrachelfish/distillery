@@ -19,6 +19,11 @@ api_key = ""
 # https://platform.claude.com/docs/en/about-claude/pricing
 input_price = 4.00
 output_price = 20.00
+# Prompt caching: the prompt repeated with every section is cached by the
+# API, and cached input is billed at these prices per million tokens.
+prompt_caching = true
+cache_write_price = 5.00
+cache_read_price = 0.20
 # Runs stop once their recorded cost passes this many US dollars.
 max_run_cost = 2.00
 # The most output tokens one call may use, thinking included. Replies cut

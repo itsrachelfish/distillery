@@ -43,6 +43,12 @@ impl Extraction {
         })
     }
 
+    /// The wording of this version: the system prompt, the reply schema and
+    /// the retry prompt.
+    pub fn wording(&self) -> (&'static str, &'static str, &'static str) {
+        (EXTRACT_CLAIMS, CLAIMS_SCHEMA, RETRY)
+    }
+
     /// The call for one section: the file path and heading path as context,
     /// then the section as written.
     pub fn prompt(&self, path: &str, headings: &str, section: &str) -> Prompt {
