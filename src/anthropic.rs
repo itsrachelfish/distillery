@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::config;
-use crate::model::{ModelError, ModelProvider, Prompt};
+use crate::model::{ModelError, ModelProvider, Prompt, Reply, Usage};
 
 const API: &str = "https://api.anthropic.com";
 /// The API version every request names.
@@ -24,6 +24,8 @@ pub struct Anthropic {
     client: reqwest::blocking::Client,
     key: String,
     model: String,
+    /// The most output tokens one call may use, thinking included.
+    max_output_tokens: u32,
 }
 
 impl Anthropic {
@@ -41,6 +43,7 @@ impl Anthropic {
             client,
             key: model.api_key.clone(),
             model: model.name.clone(),
+            max_output_tokens: model.max_output_tokens,
         })
     }
 
@@ -121,6 +124,41 @@ impl ModelProvider for Anthropic {
             message: "The Anthropic API's token count had no input_tokens.".to_owned(),
         })
     }
+
+    fn reply(&self, prompt: &Prompt) -> Result<Reply, ModelError> {
+        let mut body = self.request(prompt);
+        body["max_tokens"] = json!(self.max_output_tokens);
+        let reply = self.post("/v1/messages", &body)?;
+        read_reply(&reply).ok_or_else(|| ModelError {
+            status: Some(200),
+            retry_after: None,
+            message: "The Anthropic API's reply had no content, stop reason or usage.".to_owned(),
+        })
+    }
+}
+
+/// A message reply in Distillery's terms. Thinking blocks are left out of
+/// the text; their tokens are in the usage.
+fn read_reply(reply: &Value) -> Option<Reply> {
+    let text = reply["content"]
+        .as_array()?
+        .iter()
+        .filter(|block| block["type"] == "text")
+        .filter_map(|block| block["text"].as_str())
+        .collect::<String>();
+    let usage = &reply["usage"];
+    let tokens = |value: &Value| value.as_u64().unwrap_or(0);
+    Some(Reply {
+        text,
+        stop_reason: reply["stop_reason"].as_str()?.to_owned(),
+        usage: Usage {
+            input_tokens: usage["input_tokens"].as_u64()?,
+            output_tokens: usage["output_tokens"].as_u64()?,
+            thinking_tokens: tokens(&usage["output_tokens_details"]["thinking_tokens"]),
+            cache_write_tokens: tokens(&usage["cache_creation_input_tokens"]),
+            cache_read_tokens: tokens(&usage["cache_read_input_tokens"]),
+        },
+    })
 }
 
 /// How much of a reply that is not an API error an error message quotes.

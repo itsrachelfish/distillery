@@ -6,8 +6,7 @@
 //! estimate is recorded and never changed, so the cost of a run can be
 //! compared with what was expected.
 
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -116,12 +115,12 @@ pub fn run(
 
 /// Whether a section holds a one-line heading and nothing under it, so no
 /// call is needed for it.
-fn heading_only(section: &Section) -> bool {
+pub fn heading_only(section: &Section) -> bool {
     !section.path.is_empty() && section.start_line == section.end_line
 }
 
-/// Counts one prompt's input tokens, attempting again after rate limits and
-/// server errors. Every attempt is recorded as a model call.
+/// Counts one prompt's input tokens. Every attempt is recorded as a model
+/// call.
 fn count(
     conn: &Connection,
     provider: &dyn ModelProvider,
@@ -130,38 +129,14 @@ fn count(
     place: &str,
     progress: &mut Progress,
 ) -> Result<i64, String> {
-    let mut attempt = 1;
-    loop {
-        let started = Instant::now();
-        let reply = provider.count_tokens(prompt);
-        record(conn, provider, started.elapsed(), reply.as_ref().err())?;
-        let error = match reply {
-            Ok(tokens) => return Ok(tokens as i64),
-            Err(error) => error,
-        };
-        let Some(wait) = model::retry_wait(attempt, &error) else {
-            return Err(format!(
-                "Counting {place} failed after {}: {error}",
-                counted(attempt.into(), "attempt", "attempts")
-            ));
-        };
-        attempt += 1;
-        let until = Instant::now() + wait;
-        loop {
-            let left = until.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                break;
-            }
-            progress.update(done, || {
-                format!(
-                    "{place}, attempt {attempt} of {} in {}s: {error}",
-                    model::MAX_ATTEMPTS,
-                    left.as_secs() + 1
-                )
-            });
-            thread::sleep(left.min(Duration::from_secs(1)));
-        }
-    }
+    let tokens = model::attempt(
+        progress,
+        done,
+        &format!("Counting {place}"),
+        || provider.count_tokens(prompt),
+        |took, reply| record(conn, provider, took, reply.err()),
+    )?;
+    Ok(tokens as i64)
 }
 
 /// Records one attempt at counting tokens.
@@ -178,6 +153,7 @@ fn record(
         // Counting is free and runs no model, so no tokens are used.
         input_tokens: 0,
         output_tokens: 0,
+        thinking_tokens: 0,
         cache_write_tokens: 0,
         cache_read_tokens: 0,
         cost_micros: 0,
@@ -185,6 +161,7 @@ fn record(
         stop_reason: None,
         error: error.map(|error| error.message.clone()),
         http_status: error.and_then(|error| error.status).map(i64::from),
+        section: None,
     };
     db::record_model_call(conn, &call).map_err(|err| format!("Recording the call: {err}"))
 }

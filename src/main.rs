@@ -2,10 +2,12 @@ mod anthropic;
 mod config;
 mod db;
 mod estimate;
+mod extract;
 mod git;
 mod model;
 mod progress;
 mod prompts;
+mod quotes;
 mod sections;
 mod snapshot;
 #[cfg(test)]

@@ -12,7 +12,7 @@ use axum::routing::{get, post};
 use maud::{Markup, html};
 
 use super::layout::{self, dollars, number};
-use super::{App, Flash, PageResult, done, failed, internal, with_db};
+use super::{App, Flash, PageResult, done, failed, internal, runs, with_db};
 use crate::anthropic::Anthropic;
 use crate::config;
 use crate::db::{self, ModelCall, RecordedCall, UsageGroup, UsageTotal};
@@ -99,6 +99,8 @@ fn run_check(database: &Path, model: &config::Model) -> Result<u64, String> {
             .err()
             .and_then(|error| error.status)
             .map(i64::from),
+        thinking_tokens: 0,
+        section: None,
     };
     let conn = db::open(database).map_err(|err| format!("Opening the database: {err}"))?;
     db::record_model_call(&conn, &call).map_err(|err| format!("Recording the call: {err}"))?;
@@ -110,7 +112,9 @@ fn page(model: &config::Model, usage: &Usage) -> Markup {
         h1 { "Usage" }
         p.lead {
             "Every call to the model API is recorded here with its tokens and cost, failed "
-            "calls included. Rate-limited calls are failed calls the API answered with 429."
+            "calls included. Rate-limited calls are failed calls the API answered with 429. "
+            "Thinking tokens are the part of the output tokens the model spent thinking, "
+            "billed as output."
         }
 
         h2 { "Settings in use" }
@@ -185,6 +189,7 @@ fn totals(group: &str, rows: &[UsageTotal]) -> Markup {
                     th.number scope="col" { "Rate limited" }
                     th.number scope="col" { "Tokens in" }
                     th.number scope="col" { "Tokens out" }
+                    th.number scope="col" { "Thinking" }
                     th.number scope="col" { "Cost" }
                 }
             }
@@ -197,6 +202,7 @@ fn totals(group: &str, rows: &[UsageTotal]) -> Markup {
                         td.number { (number(row.rate_limited)) }
                         td.number { (number(row.input_tokens)) }
                         td.number { (number(row.output_tokens)) }
+                        td.number { (number(row.thinking_tokens)) }
                         td.number { (dollars(row.cost_micros)) }
                     }
                 }
@@ -216,6 +222,7 @@ fn latest(rows: &[RecordedCall]) -> Markup {
                     th scope="col" { "Model" }
                     th.number scope="col" { "Tokens in" }
                     th.number scope="col" { "Tokens out" }
+                    th.number scope="col" { "Thinking" }
                     th.number scope="col" { "Cost" }
                     th.number scope="col" { "Took" }
                     th scope="col" { "Result" }
@@ -226,7 +233,19 @@ fn latest(rows: &[RecordedCall]) -> Markup {
                     @let call = &row.call;
                     tr {
                         td { (layout::utc(&row.created_at)) }
-                        td { (call.operation) }
+                        td {
+                            (call.operation)
+                            @if let Some(section) = &call.section {
+                                br;
+                                a.note href=(runs::href(section.run_id)) {
+                                    "run " (section.run_id)
+                                }
+                                span.note {
+                                    " · " (section.path) " lines " (section.start_line) "–"
+                                    (section.end_line)
+                                }
+                            }
+                        }
                         td { (call.model) br; span.note { (call.provider) } }
                         td.number title=(format!(
                             "Prompt cache: {} written, {} read",
@@ -236,6 +255,7 @@ fn latest(rows: &[RecordedCall]) -> Markup {
                             (number(call.input_tokens))
                         }
                         td.number { (number(call.output_tokens)) }
+                        td.number { (number(call.thinking_tokens)) }
                         td.number { (dollars(call.cost_micros)) }
                         td.number { (number(call.duration_ms)) " ms" }
                         td {

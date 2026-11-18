@@ -55,6 +55,9 @@ pub struct Model {
     /// Runs stop once their recorded cost passes this many US dollars.
     #[serde(default = "default_max_run_cost")]
     pub max_run_cost: f64,
+    /// The most output tokens one call may use, thinking included.
+    #[serde(default = "default_max_output_tokens")]
+    pub max_output_tokens: u32,
 }
 
 impl Model {
@@ -104,6 +107,10 @@ fn default_output_price() -> f64 {
     20.0
 }
 
+fn default_max_output_tokens() -> u32 {
+    8192
+}
+
 fn default_max_run_cost() -> f64 {
     2.0
 }
@@ -132,6 +139,7 @@ impl Default for Model {
             input_price: default_input_price(),
             output_price: default_output_price(),
             max_run_cost: default_max_run_cost(),
+            max_output_tokens: default_max_output_tokens(),
         }
     }
 }
@@ -209,6 +217,10 @@ impl Config {
                     "{setting} must be an amount in US dollars, zero or more"
                 ));
             }
+        }
+
+        if self.model.max_output_tokens == 0 {
+            return Err("model.max_output_tokens must be 1 or more".to_owned());
         }
 
         if self.storage.database.as_os_str().is_empty() {

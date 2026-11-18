@@ -173,6 +173,17 @@ pub fn file_at(clone: &Path, commit: &str, path: &str) -> Result<String, String>
     Ok(String::from_utf8_lossy(&contents).into_owned())
 }
 
+/// The hash of a file's contents at a commit: its blob in git. Files with
+/// the same contents have the same hash, at any commit and path.
+pub fn blob_at(clone: &Path, commit: &str, path: &str) -> Result<String, String> {
+    let mut command = git();
+    command.arg("--git-dir").arg(clone);
+    command.args(["rev-parse", "--verify", "--end-of-options"]);
+    command.arg(format!("{commit}:{path}"));
+    let output = run_captured(command, "git rev-parse")?;
+    Ok(String::from_utf8_lossy(&output).trim().to_owned())
+}
+
 /// The hash git gives a file with these contents, as `git hash-object`
 /// prints it. Nothing is written to any repository.
 pub fn hash_object(contents: &[u8]) -> Result<String, String> {

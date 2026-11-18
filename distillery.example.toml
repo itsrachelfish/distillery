@@ -21,6 +21,9 @@ input_price = 4.00
 output_price = 20.00
 # Runs stop once their recorded cost passes this many US dollars.
 max_run_cost = 2.00
+# The most output tokens one call may use, thinking included. Replies cut
+# off at this limit leave their section not distilled.
+max_output_tokens = 8192
 
 [storage]
 # SQLite database, created when missing.

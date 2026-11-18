@@ -18,7 +18,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema, as the steps that build it. Steps are only ever added at the
 /// end: released steps never change.
-const MIGRATIONS: [&str; 3] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3];
+const MIGRATIONS: [&str; 4] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4];
 
 const SCHEMA_V1: &str = "
 -- Git repositories added by users.
@@ -117,6 +117,94 @@ CREATE TABLE estimate_sections (
     input_tokens INTEGER NOT NULL,
     PRIMARY KEY (estimate_id, start_line)
 );
+";
+
+const SCHEMA_V4: &str = "
+-- One extraction run: Markdown files at one commit, sent section by section
+-- to one model with one prompt version.
+CREATE TABLE runs (
+    id INTEGER PRIMARY KEY,
+    source_id INTEGER NOT NULL REFERENCES sources (id),
+    -- The full commit hash the files were read at.
+    commit_hash TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    -- The estimate the run started from, for comparison with its cost.
+    estimate_id INTEGER REFERENCES estimates (id),
+    -- UTC, as YYYY-MM-DD HH:MM:SS.
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    -- NULL while the run is going, and for runs cut short with the server.
+    finished_at TEXT,
+    -- How the run ended, in words.
+    outcome TEXT
+);
+
+-- The files of a run, with the hash of their contents.
+CREATE TABLE run_files (
+    run_id INTEGER NOT NULL REFERENCES runs (id),
+    path TEXT NOT NULL,
+    blob_hash TEXT NOT NULL,
+    PRIMARY KEY (run_id, path)
+);
+
+-- One section's result, and the per-section cache: sections with the same
+-- file contents, lines, prompt version and model are never sent again once
+-- distilled.
+CREATE TABLE extractions (
+    id INTEGER PRIMARY KEY,
+    -- The run that sent the section.
+    run_id INTEGER NOT NULL REFERENCES runs (id),
+    blob_hash TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    prompt_version TEXT NOT NULL,
+    model TEXT NOT NULL,
+    -- 1 when every claim of the reply passed validation, 0 for sections
+    -- left not distilled.
+    distilled INTEGER NOT NULL,
+    -- Why the section was left not distilled.
+    reason TEXT,
+    -- The model's last reply for the section, as it arrived.
+    reply TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX extractions_section
+    ON extractions (blob_hash, start_line, end_line, prompt_version, model);
+
+-- Exact quotes at fixed lines of fixed file contents.
+CREATE TABLE spans (
+    id INTEGER PRIMARY KEY,
+    blob_hash TEXT NOT NULL,
+    start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    -- The quote as the model gave it. It matches the lines when whitespace
+    -- is ignored.
+    quote TEXT NOT NULL
+);
+
+-- Atomic claims, each resting on one span.
+CREATE TABLE claims (
+    id INTEGER PRIMARY KEY,
+    extraction_id INTEGER NOT NULL REFERENCES extractions (id),
+    span_id INTEGER NOT NULL REFERENCES spans (id),
+    text TEXT NOT NULL,
+    -- behavior, configuration, requirement, decision, instruction or
+    -- rationale.
+    kind TEXT NOT NULL,
+    -- 1 for examples, 0 for facts about the project.
+    illustrative INTEGER NOT NULL
+);
+CREATE INDEX claims_extraction ON claims (extraction_id);
+
+-- Output tokens spent on thinking, a part of output_tokens.
+ALTER TABLE model_calls ADD COLUMN thinking_tokens INTEGER NOT NULL DEFAULT 0;
+-- The run, file and section of calls made by runs.
+ALTER TABLE model_calls ADD COLUMN run_id INTEGER REFERENCES runs (id);
+ALTER TABLE model_calls ADD COLUMN path TEXT;
+ALTER TABLE model_calls ADD COLUMN start_line INTEGER;
+ALTER TABLE model_calls ADD COLUMN end_line INTEGER;
+CREATE INDEX model_calls_run ON model_calls (run_id);
 ";
 
 /// Opens the database, creating it when the file is new and running the
@@ -249,6 +337,15 @@ pub fn revisions(conn: &Connection, source_id: i64) -> Result<Vec<Revision>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// The section a run's call was for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSection {
+    pub run_id: i64,
+    pub path: String,
+    pub start_line: i64,
+    pub end_line: i64,
+}
+
 /// One call to a model API, as recorded for usage and cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelCall {
@@ -256,7 +353,10 @@ pub struct ModelCall {
     pub model: String,
     pub operation: String,
     pub input_tokens: i64,
+    /// Everything billed as output, thinking included.
     pub output_tokens: i64,
+    /// The part of the output tokens spent on thinking.
+    pub thinking_tokens: i64,
     pub cache_write_tokens: i64,
     pub cache_read_tokens: i64,
     /// Millionths of a US dollar.
@@ -267,15 +367,19 @@ pub struct ModelCall {
     pub error: Option<String>,
     /// The HTTP status of a failed call's reply, when one arrived.
     pub http_status: Option<i64>,
+    /// `None` for calls outside runs.
+    pub section: Option<CallSection>,
 }
 
 /// Records a call to a model API.
 pub fn record_model_call(conn: &Connection, call: &ModelCall) -> Result<()> {
+    let section = call.section.as_ref();
     conn.execute(
         "INSERT INTO model_calls (provider, model, operation, input_tokens, output_tokens,
              cache_write_tokens, cache_read_tokens, cost_micros, duration_ms, stop_reason,
-             success, error, http_status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             success, error, http_status, thinking_tokens, run_id, path, start_line, end_line)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+             ?18)",
         params![
             call.provider,
             call.model,
@@ -290,6 +394,11 @@ pub fn record_model_call(conn: &Connection, call: &ModelCall) -> Result<()> {
             call.error.is_none(),
             call.error,
             call.http_status,
+            call.thinking_tokens,
+            section.map(|section| section.run_id),
+            section.map(|section| section.path.as_str()),
+            section.map(|section| section.start_line),
+            section.map(|section| section.end_line),
         ],
     )?;
     Ok(())
@@ -306,6 +415,8 @@ pub struct UsageTotal {
     pub rate_limited: i64,
     pub input_tokens: i64,
     pub output_tokens: i64,
+    /// The part of the output tokens spent on thinking.
+    pub thinking_tokens: i64,
     pub cost_micros: i64,
 }
 
@@ -329,7 +440,8 @@ pub fn usage_totals(conn: &Connection, group: UsageGroup) -> Result<Vec<UsageTot
     let mut statement = conn.prepare(&format!(
         "SELECT {column}, count(*), sum(1 - success),
                 count(CASE WHEN http_status = 429 THEN 1 END),
-                sum(input_tokens), sum(output_tokens), sum(cost_micros)
+                sum(input_tokens), sum(output_tokens), sum(thinking_tokens),
+                sum(cost_micros)
          FROM model_calls GROUP BY 1 ORDER BY {order}"
     ))?;
     let rows = statement.query_map([], |row| {
@@ -340,7 +452,8 @@ pub fn usage_totals(conn: &Connection, group: UsageGroup) -> Result<Vec<UsageTot
             rate_limited: row.get(3)?,
             input_tokens: row.get(4)?,
             output_tokens: row.get(5)?,
-            cost_micros: row.get(6)?,
+            thinking_tokens: row.get(6)?,
+            cost_micros: row.get(7)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -358,7 +471,7 @@ pub fn latest_model_calls(conn: &Connection, limit: i64) -> Result<Vec<RecordedC
     let mut statement = conn.prepare(
         "SELECT created_at, provider, model, operation, input_tokens, output_tokens,
                 cache_write_tokens, cache_read_tokens, cost_micros, duration_ms, stop_reason,
-                error, http_status
+                error, http_status, thinking_tokens, run_id, path, start_line, end_line
          FROM model_calls ORDER BY id DESC LIMIT ?1",
     )?;
     let rows = statement.query_map(params![limit], |row| {
@@ -377,6 +490,16 @@ pub fn latest_model_calls(conn: &Connection, limit: i64) -> Result<Vec<RecordedC
                 stop_reason: row.get(10)?,
                 error: row.get(11)?,
                 http_status: row.get(12)?,
+                thinking_tokens: row.get(13)?,
+                section: match row.get::<_, Option<i64>>(14)? {
+                    Some(run_id) => Some(CallSection {
+                        run_id,
+                        path: row.get(15)?,
+                        start_line: row.get(16)?,
+                        end_line: row.get(17)?,
+                    }),
+                    None => None,
+                },
             },
         })
     })?;
@@ -569,6 +692,318 @@ pub fn estimate_sections(conn: &Connection, estimate_id: i64) -> Result<Vec<Esti
             start_line: row.get(0)?,
             end_line: row.get(1)?,
             input_tokens: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A run to start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub source_id: i64,
+    /// The full commit hash the files are read at.
+    pub commit_hash: String,
+    pub provider: String,
+    pub model: String,
+    pub prompt_version: String,
+    /// The estimate the run starts from.
+    pub estimate_id: Option<i64>,
+}
+
+/// Records a run as started, with its one file, and returns its ID.
+pub fn start_run(conn: &mut Connection, run: &Run, path: &str, blob_hash: &str) -> Result<i64> {
+    let transaction = conn.transaction()?;
+    transaction.execute(
+        "INSERT INTO runs (source_id, commit_hash, provider, model, prompt_version, estimate_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            run.source_id,
+            run.commit_hash,
+            run.provider,
+            run.model,
+            run.prompt_version,
+            run.estimate_id
+        ],
+    )?;
+    let id = transaction.last_insert_rowid();
+    transaction.execute(
+        "INSERT INTO run_files (run_id, path, blob_hash) VALUES (?1, ?2, ?3)",
+        params![id, path, blob_hash],
+    )?;
+    transaction.commit()?;
+    Ok(id)
+}
+
+/// Records how a run ended.
+pub fn finish_run(conn: &Connection, run_id: i64, outcome: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE runs SET finished_at = datetime('now'), outcome = ?2 WHERE id = ?1",
+        params![run_id, outcome],
+    )?;
+    Ok(())
+}
+
+/// A run with its ID, times and outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedRun {
+    pub id: i64,
+    /// UTC.
+    pub started_at: String,
+    /// `None` while the run is going, and for runs cut short with the server.
+    pub outcome: Option<String>,
+    pub run: Run,
+}
+
+/// The run with this ID, if there is one.
+pub fn find_run(conn: &Connection, id: i64) -> Result<Option<RecordedRun>> {
+    Ok(conn
+        .query_row(
+            "SELECT id, started_at, outcome, source_id, commit_hash, provider, model,
+                    prompt_version, estimate_id
+             FROM runs WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(RecordedRun {
+                    id: row.get(0)?,
+                    started_at: row.get(1)?,
+                    outcome: row.get(2)?,
+                    run: Run {
+                        source_id: row.get(3)?,
+                        commit_hash: row.get(4)?,
+                        provider: row.get(5)?,
+                        model: row.get(6)?,
+                        prompt_version: row.get(7)?,
+                        estimate_id: row.get(8)?,
+                    },
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// The path and blob hash of a run's file. Runs have one file so far.
+pub fn run_file(conn: &Connection, run_id: i64) -> Result<Option<(String, String)>> {
+    Ok(conn
+        .query_row(
+            "SELECT path, blob_hash FROM run_files WHERE run_id = ?1 ORDER BY path LIMIT 1",
+            params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
+}
+
+/// The ID of the latest run of a file at a commit, if it has one.
+pub fn latest_run(
+    conn: &Connection,
+    source_id: i64,
+    commit_hash: &str,
+    path: &str,
+) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT runs.id FROM runs JOIN run_files ON run_files.run_id = runs.id
+             WHERE runs.source_id = ?1 AND runs.commit_hash = ?2 AND run_files.path = ?3
+             ORDER BY runs.id DESC LIMIT 1",
+            params![source_id, commit_hash, path],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// What identifies a section to the cache: the file's contents, the
+/// section's lines, and the prompt version and model that read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionKey<'a> {
+    pub blob_hash: &'a str,
+    pub start_line: i64,
+    pub end_line: i64,
+    pub prompt_version: &'a str,
+    pub model: &'a str,
+}
+
+/// The run that distilled a section, when the cache holds it.
+pub fn cached_extraction(conn: &Connection, key: &SectionKey) -> Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT run_id FROM extractions
+             WHERE blob_hash = ?1 AND start_line = ?2 AND end_line = ?3
+               AND prompt_version = ?4 AND model = ?5 AND distilled = 1
+             ORDER BY id DESC LIMIT 1",
+            params![
+                key.blob_hash,
+                key.start_line,
+                key.end_line,
+                key.prompt_version,
+                key.model
+            ],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// A claim that passed validation, with the lines of its quote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Claim {
+    pub text: String,
+    pub kind: String,
+    pub illustrative: bool,
+    pub quote: String,
+    pub start_line: i64,
+    pub end_line: i64,
+}
+
+/// Records a section's result for a run. `claims` are the claims of a
+/// distilled section; `reason` says why a section was left not distilled.
+pub fn record_extraction(
+    conn: &mut Connection,
+    run_id: i64,
+    key: &SectionKey,
+    claims: &[Claim],
+    reason: Option<&str>,
+    reply: &str,
+) -> Result<()> {
+    let transaction = conn.transaction()?;
+    transaction.execute(
+        "INSERT INTO extractions (run_id, blob_hash, start_line, end_line, prompt_version,
+             model, distilled, reason, reply)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            run_id,
+            key.blob_hash,
+            key.start_line,
+            key.end_line,
+            key.prompt_version,
+            key.model,
+            reason.is_none(),
+            reason,
+            reply
+        ],
+    )?;
+    let extraction = transaction.last_insert_rowid();
+    for claim in claims {
+        transaction.execute(
+            "INSERT INTO spans (blob_hash, start_line, end_line, quote) VALUES (?1, ?2, ?3, ?4)",
+            params![key.blob_hash, claim.start_line, claim.end_line, claim.quote],
+        )?;
+        let span = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO claims (extraction_id, span_id, text, kind, illustrative)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![extraction, span, claim.text, claim.kind, claim.illustrative],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// A section's result in a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extraction {
+    pub start_line: i64,
+    pub end_line: i64,
+    pub distilled: bool,
+    pub reason: Option<String>,
+    pub reply: String,
+    pub claims: i64,
+}
+
+/// The results a run recorded, in file order.
+pub fn run_extractions(conn: &Connection, run_id: i64) -> Result<Vec<Extraction>> {
+    let mut statement = conn.prepare(
+        "SELECT start_line, end_line, distilled, reason, reply,
+                (SELECT count(*) FROM claims WHERE extraction_id = extractions.id)
+         FROM extractions WHERE run_id = ?1 ORDER BY start_line, id",
+    )?;
+    let rows = statement.query_map(params![run_id], |row| {
+        Ok(Extraction {
+            start_line: row.get(0)?,
+            end_line: row.get(1)?,
+            distilled: row.get(2)?,
+            reason: row.get(3)?,
+            reply: row.get(4)?,
+            claims: row.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// What a run's calls for one section used, added up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SectionUsage {
+    pub start_line: i64,
+    pub end_line: i64,
+    pub calls: i64,
+    pub failed: i64,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub thinking_tokens: i64,
+    pub cost_micros: i64,
+}
+
+/// A run's usage by section, in file order.
+pub fn run_usage(conn: &Connection, run_id: i64) -> Result<Vec<SectionUsage>> {
+    let mut statement = conn.prepare(
+        "SELECT start_line, end_line, count(*), sum(1 - success), sum(input_tokens),
+                sum(output_tokens), sum(thinking_tokens), sum(cost_micros)
+         FROM model_calls WHERE run_id = ?1 GROUP BY start_line, end_line ORDER BY start_line",
+    )?;
+    let rows = statement.query_map(params![run_id], |row| {
+        Ok(SectionUsage {
+            start_line: row.get(0)?,
+            end_line: row.get(1)?,
+            calls: row.get(2)?,
+            failed: row.get(3)?,
+            input_tokens: row.get(4)?,
+            output_tokens: row.get(5)?,
+            thinking_tokens: row.get(6)?,
+            cost_micros: row.get(7)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A claim as pages show it, with the section it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShownClaim {
+    pub id: i64,
+    /// The first line of the claim's section.
+    pub section_start: i64,
+    /// The prompt version and model that extracted it.
+    pub prompt_version: String,
+    pub model: String,
+    pub claim: Claim,
+}
+
+/// The claims of a file's contents: for each section, those of its latest
+/// distilled extraction.
+pub fn claims_of_blob(conn: &Connection, blob_hash: &str) -> Result<Vec<ShownClaim>> {
+    let mut statement = conn.prepare(
+        "SELECT claims.id, extractions.start_line, extractions.prompt_version,
+                extractions.model, claims.text, claims.kind, claims.illustrative, spans.quote,
+                spans.start_line, spans.end_line
+         FROM extractions
+         JOIN claims ON claims.extraction_id = extractions.id
+         JOIN spans ON spans.id = claims.span_id
+         WHERE extractions.id IN (
+             SELECT max(id) FROM extractions
+             WHERE blob_hash = ?1 AND distilled = 1 GROUP BY start_line, end_line
+         )
+         ORDER BY extractions.start_line, claims.id",
+    )?;
+    let rows = statement.query_map(params![blob_hash], |row| {
+        Ok(ShownClaim {
+            id: row.get(0)?,
+            section_start: row.get(1)?,
+            prompt_version: row.get(2)?,
+            model: row.get(3)?,
+            claim: Claim {
+                text: row.get(4)?,
+                kind: row.get(5)?,
+                illustrative: row.get(6)?,
+                quote: row.get(7)?,
+                start_line: row.get(8)?,
+                end_line: row.get(9)?,
+            },
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

@@ -304,3 +304,36 @@ caption {
 .failed {
     color: var(--danger);
 }
+
+/* Claims under their section on the File page. */
+table.lines tr.claims td {
+    height: auto;
+    padding: 0.5rem 0.75rem 0.75rem 3.5rem;
+    background: var(--surface);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    white-space: normal;
+}
+
+tr.claims ul {
+    margin: 0.25rem 0 0;
+    padding-left: 1.1rem;
+}
+
+tr.claims li {
+    margin-bottom: 0.4rem;
+}
+
+.kind {
+    padding: 0 0.4rem;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--muted);
+    font-size: 0.8rem;
+}
+
+pre.reply {
+    max-width: 40rem;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    font-size: 0.85rem;
+}

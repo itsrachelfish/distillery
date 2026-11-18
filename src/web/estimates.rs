@@ -1,6 +1,6 @@
 //! Estimates: "Distill" on the File page counts a file's tokens as a job,
 //! and the Estimate page shows the expected cost before anything is sent to
-//! a model.
+//! a model. "Start run" there is what sends it.
 
 use axum::extract::{Query, State};
 use axum::response::Redirect;
@@ -12,13 +12,14 @@ use serde::Deserialize;
 use super::jobs::{self, Finished};
 use super::layout::{self, dollars, number};
 use super::sources as source_pages;
-use super::{App, Flash, PageError, PageResult, failed, files, internal, with_db};
+use super::{App, Flash, PageError, PageResult, failed, files, internal, runs, with_db};
 use crate::anthropic::{self, Anthropic};
 use crate::config;
-use crate::db::{self, EstimateSection, RecordedEstimate, Source};
+use crate::db::{self, EstimateSection, RecordedEstimate, SectionKey, Source};
 use crate::estimate;
 use crate::git;
 use crate::progress::counted;
+use crate::prompts;
 use crate::sections::{self, Section};
 
 pub(super) fn routes() -> Router<App> {
@@ -126,12 +127,34 @@ async fn estimate_page(
         let contents = git::file_at(&clone, &estimate.commit_hash, &estimate.path)
             .map_err(PageError::internal)?;
         let sections = sections::split(&contents);
+        // Sections that runs would skip, since the cache holds them.
+        let blob_hash = git::blob_at(&clone, &estimate.commit_hash, &estimate.path)
+            .map_err(PageError::internal)?;
+        let mut cached = 0;
+        for section in &counted {
+            let key = SectionKey {
+                blob_hash: &blob_hash,
+                start_line: section.start_line,
+                end_line: section.end_line,
+                prompt_version: &estimate.prompt_version,
+                model: &estimate.model,
+            };
+            if db::cached_extraction(conn, &key)
+                .map_err(internal)?
+                .is_some()
+            {
+                cached += 1;
+            }
+        }
+        let prompt = prompts::Extraction::load().map_err(PageError::internal)?;
         let view = View {
             recorded: &recorded,
             source: &source,
             counted: &counted,
             sections: &sections,
             model: &model,
+            cached,
+            current: estimate.model == model.name && estimate.prompt_version == prompt.version,
         };
         Ok(layout::page(
             &format!("Estimate for {}", estimate.path),
@@ -152,6 +175,10 @@ struct View<'a> {
     sections: &'a [Section],
     /// The settings in use, for the run cost limit.
     model: &'a config::Model,
+    /// How many of the counted sections are distilled already.
+    cached: i64,
+    /// Whether the estimate was counted for the model and prompt in use.
+    current: bool,
 }
 
 fn page(view: &View) -> Markup {
@@ -207,6 +234,13 @@ fn page(view: &View) -> Markup {
                                 " skipped, holding a heading alone"
                             }
                         }
+                    }
+                }
+                tr {
+                    th scope="row" { "Sections cached" }
+                    td {
+                        (number(view.cached))
+                        span.note { " · distilled already, so runs don't send them again" }
                     }
                 }
                 tr {
@@ -294,6 +328,19 @@ fn page(view: &View) -> Markup {
                 }
             }
         }
-        p.note { "Starting a run from an estimate comes with the next build step." }
+
+        h2 { "Run" }
+        @if view.current {
+            form.inline method="post" action="/run" {
+                input type="hidden" name="estimate" value=(view.recorded.id);
+                button type="submit" { "Start run" }
+                span.note {
+                    "Sends the sections that aren't cached to " code { (estimate.model) }
+                    ". This costs money, and stops once the run passes " (dollars(limit)) "."
+                }
+            }
+        } @else {
+            p.note { (runs::STALE) }
+        }
     }
 }
