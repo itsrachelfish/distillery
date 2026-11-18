@@ -12,6 +12,7 @@ v1 distills Markdown docs in git repos. Find stale, redundant, and conflicting c
 
 ```bash
 cp distillery.example.toml distillery.toml
-cargo run
-cargo run -- snapshot https://github.com/wetfish/server
+cargo run -- serve
 ```
+
+Set `api_key` under `[model]` in `distillery.toml`, then open http://127.0.0.1:8080/ and add a repo.
