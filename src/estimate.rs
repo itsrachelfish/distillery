@@ -13,6 +13,7 @@ use rusqlite::Connection;
 use crate::config;
 use crate::db::{self, Estimate, EstimateSection, ModelCall};
 use crate::model::{self, ModelError, ModelProvider, Prompt};
+use crate::passages;
 use crate::progress::{Progress, counted};
 use crate::prompts::{self, Extraction};
 use crate::sections::{self, Section};
@@ -92,9 +93,14 @@ pub fn run(
         let lines: Vec<&str> = file.contents.lines().collect();
         let mut sections = Vec::with_capacity(to_send.len());
         for section in &to_send {
-            // Sections are sent as written.
-            let text = lines[section.start_line - 1..section.end_line].join("\n");
-            let prompt = extraction.prompt(file.path, &section.title(), &text);
+            let section_lines = &lines[section.start_line - 1..section.end_line];
+            let cut = passages::cut(section_lines, section.start_line);
+            let sent = prompts::Section {
+                lines: section_lines,
+                first_line: section.start_line,
+                passages: &cut,
+            };
+            let prompt = extraction.prompt(file.path, &section.title(), &sent);
             let place = format!(
                 "{} lines {}–{}",
                 file.path, section.start_line, section.end_line

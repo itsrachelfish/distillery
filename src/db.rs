@@ -18,7 +18,9 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema, as the steps that build it. Steps are only ever added at the
 /// end: released steps never change.
-const MIGRATIONS: [&str; 5] = [SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5];
+const MIGRATIONS: [&str; 6] = [
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6,
+];
 
 const SCHEMA_V1: &str = "
 -- Git repositories added by users.
@@ -224,6 +226,15 @@ CREATE TABLE prompt_versions (
     -- UTC, as YYYY-MM-DD HH:MM:SS.
     first_used_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+";
+
+const SCHEMA_V6: &str = "
+-- Where a span starts in its first line and ends in its last: columns from
+-- 1, counted in characters. NULL for spans from before claims pointed at
+-- numbered passages. From here on the quote is the source text between those
+-- places, supplied by Distillery and not by the model.
+ALTER TABLE spans ADD COLUMN start_column INTEGER;
+ALTER TABLE spans ADD COLUMN end_column INTEGER;
 ";
 
 /// Opens the database, creating it when the file is new and running the
@@ -1007,9 +1018,14 @@ pub struct Claim {
     pub text: String,
     pub kind: String,
     pub illustrative: bool,
+    /// The source text the claim rests on.
     pub quote: String,
     pub start_line: i64,
     pub end_line: i64,
+    /// The columns where the quote starts in its first line and ends in its
+    /// last, from 1. `None` for claims whose quotes the model wrote.
+    pub start_column: Option<i64>,
+    pub end_column: Option<i64>,
 }
 
 /// Records a section's result for a run. `claims` are the claims of a
@@ -1042,8 +1058,16 @@ pub fn record_extraction(
     let extraction = transaction.last_insert_rowid();
     for claim in claims {
         transaction.execute(
-            "INSERT INTO spans (blob_hash, start_line, end_line, quote) VALUES (?1, ?2, ?3, ?4)",
-            params![key.blob_hash, claim.start_line, claim.end_line, claim.quote],
+            "INSERT INTO spans (blob_hash, start_line, end_line, quote, start_column, end_column)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                key.blob_hash,
+                claim.start_line,
+                claim.end_line,
+                claim.quote,
+                claim.start_column,
+                claim.end_column
+            ],
         )?;
         let span = transaction.last_insert_rowid();
         transaction.execute(
@@ -1151,7 +1175,7 @@ pub fn claims_of_blob(conn: &Connection, blob_hash: &str) -> Result<Vec<ShownCla
     let mut statement = conn.prepare(
         "SELECT claims.id, extractions.start_line, extractions.prompt_version,
                 extractions.model, claims.text, claims.kind, claims.illustrative, spans.quote,
-                spans.start_line, spans.end_line
+                spans.start_line, spans.end_line, spans.start_column, spans.end_column
          FROM extractions
          JOIN claims ON claims.extraction_id = extractions.id
          JOIN spans ON spans.id = claims.span_id
@@ -1174,6 +1198,8 @@ pub fn claims_of_blob(conn: &Connection, blob_hash: &str) -> Result<Vec<ShownCla
                 quote: row.get(7)?,
                 start_line: row.get(8)?,
                 end_line: row.get(9)?,
+                start_column: row.get(10)?,
+                end_column: row.get(11)?,
             },
         })
     })?;

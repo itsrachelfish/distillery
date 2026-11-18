@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::git;
 use crate::model::Prompt;
+use crate::passages::{self, Passage};
 
 const EXTRACT_CLAIMS: &str = include_str!("../prompts/extract_claims.md");
 const CLAIMS_SCHEMA: &str = include_str!("../prompts/claims_schema.json");
@@ -18,6 +19,14 @@ const PROBLEMS: &str = "{problems}";
 
 /// What usage records call the calls that extract claims.
 pub const EXTRACT_OPERATION: &str = "extract_claims";
+
+/// A section as prompts need it: its lines, the line number of the first,
+/// and its passages.
+pub struct Section<'a> {
+    pub lines: &'a [&'a str],
+    pub first_line: usize,
+    pub passages: &'a [Passage],
+}
 
 /// Pass 1: atomic claims from one section per call.
 pub struct Extraction {
@@ -50,18 +59,25 @@ impl Extraction {
     }
 
     /// The call for one section: the file path and heading path as context,
-    /// then the section as written.
-    pub fn prompt(&self, path: &str, headings: &str, section: &str) -> Prompt {
+    /// then the section with its passages numbered.
+    pub fn prompt(&self, path: &str, headings: &str, section: &Section) -> Prompt {
+        let numbered = passages::numbered(section.lines, section.first_line, section.passages);
         Prompt {
             system: Some(self.system.clone()),
-            user: format!("File: {path}\nHeadings: {headings}\n<section>\n{section}\n</section>"),
+            user: format!("File: {path}\nHeadings: {headings}\n<section>\n{numbered}\n</section>"),
             schema: Some(self.schema.clone()),
         }
     }
 
     /// The call for a section again, after a reply with problems: the same
     /// message, then the problems.
-    pub fn retry(&self, path: &str, headings: &str, section: &str, problems: &[String]) -> Prompt {
+    pub fn retry(
+        &self,
+        path: &str,
+        headings: &str,
+        section: &Section,
+        problems: &[String],
+    ) -> Prompt {
         let list: Vec<String> = problems
             .iter()
             .map(|problem| format!("- {problem}"))

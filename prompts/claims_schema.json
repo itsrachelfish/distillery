@@ -1,21 +1,23 @@
 {
   "type": "object",
   "properties": {
-    "claims": {
+    "c": {
       "type": "array",
+      "description": "claims",
       "items": {
         "type": "object",
         "properties": {
-          "text": { "type": "string", "description": "The claim as one concise statement" },
-          "kind": { "type": "string", "enum": ["behavior", "configuration", "requirement", "decision", "instruction", "rationale"] },
-          "quote": { "type": "string", "description": "Exact text from the section that the claim rests on" },
-          "illustrative": { "type": "boolean", "description": "True for examples, not facts about the project" }
+          "t": { "type": "string", "description": "text: the claim as a short note: subject, colon, fact" },
+          "k": { "type": "string", "description": "kind", "enum": ["behavior", "configuration", "requirement", "decision", "instruction", "rationale"] },
+          "f": { "type": "integer", "description": "first: the number of the first passage the claim rests on" },
+          "l": { "type": "integer", "description": "last: the number of the last passage the claim rests on" },
+          "i": { "type": "boolean", "description": "illustrative: true for examples, not facts about the project" }
         },
-        "required": ["text", "kind", "quote", "illustrative"],
+        "required": ["t", "k", "f", "l", "i"],
         "additionalProperties": false
       }
     }
   },
-  "required": ["claims"],
+  "required": ["c"],
   "additionalProperties": false
 }

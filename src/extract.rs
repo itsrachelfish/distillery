@@ -1,8 +1,8 @@
 //! The extraction stage, pass 1: atomic claims from each section of a file.
 //!
 //! One call per section. Replies are held to the claims schema by the API,
-//! and Distillery checks what the schema can't: every quote has to appear in
-//! its section. Replies with problems go back to the model once. Sections
+//! and Distillery checks what the schema can't: every claim has to rest on
+//! passages of its section. Replies with problems go back to the model once. Sections
 //! that fail again, and replies cut off or refused, are left not distilled
 //! with the reply kept. Distilled sections are cached, so later runs never
 //! send them again.
@@ -16,9 +16,9 @@ use crate::config;
 use crate::db::{self, CallSection, Claim, ModelCall, RunFile, SectionKey};
 use crate::estimate::heading_only;
 use crate::model::{self, ModelError, ModelProvider, Prompt, Reply};
+use crate::passages::{self, Passage};
 use crate::progress::{Progress, counted};
 use crate::prompts::{self, Extraction};
-use crate::quotes;
 use crate::sections::{self, Section};
 
 /// The kinds of claims, as the reply schema lists them.
@@ -30,8 +30,19 @@ const KINDS: [&str; 6] = [
     "instruction",
     "rationale",
 ];
-/// How much of a rejected quote a problem repeats.
-const QUOTED: usize = 120;
+
+/// The reply's keys. Single letters keep replies short, since every claim
+/// repeats them.
+mod key {
+    pub const CLAIMS: &str = "c";
+    pub const TEXT: &str = "t";
+    pub const KIND: &str = "k";
+    /// The number of the first passage a claim rests on.
+    pub const FIRST: &str = "f";
+    /// The number of the last passage.
+    pub const LAST: &str = "l";
+    pub const ILLUSTRATIVE: &str = "i";
+}
 
 /// A Markdown file at the run's commit.
 pub struct File<'a> {
@@ -195,8 +206,13 @@ fn distill(
             section,
             lines,
         } = waiting;
-        // Sections are sent as written.
-        let text = lines.join("\n");
+        // Claims point at passages by number, so the model writes no quotes.
+        let cut = passages::cut(lines, section.start_line);
+        let sent = prompts::Section {
+            lines,
+            first_line: section.start_line,
+            passages: &cut,
+        };
         let title = section.title();
         let call = Call {
             provider,
@@ -211,14 +227,14 @@ fn distill(
         };
         progress.update(call.done, || call.place());
 
-        let prompt = extraction.prompt(file.path, &title, &text);
+        let prompt = extraction.prompt(file.path, &title, &sent);
         let first = call.send(conn, &prompt, &mut ran.cost_micros, progress)?;
-        let mut judged = judge(first, lines, section.start_line);
+        let mut judged = judge(first, &sent);
         if let Judged::Problems(problems, _) = &judged {
             // Rejected claims go back to the model once, with the reasons.
-            let prompt = extraction.retry(file.path, &title, &text, problems);
+            let prompt = extraction.retry(file.path, &title, &sent, problems);
             let second = call.send(conn, &prompt, &mut ran.cost_micros, progress)?;
-            judged = judge(second, lines, section.start_line);
+            judged = judge(second, &sent);
         }
 
         let (claims, reason, reply) = match judged {
@@ -333,9 +349,8 @@ enum Judged {
     Incomplete(String, String),
 }
 
-/// Checks a reply against its section. `first_line` is the line number of
-/// the first of `lines`.
-fn judge(reply: Reply, lines: &[&str], first_line: usize) -> Judged {
+/// Checks a reply against its section.
+fn judge(reply: Reply, section: &prompts::Section) -> Judged {
     if !reply.complete() {
         let reason = match reply.stop_reason.as_str() {
             "max_tokens" => "The reply was cut off at the output token limit.".to_owned(),
@@ -344,48 +359,59 @@ fn judge(reply: Reply, lines: &[&str], first_line: usize) -> Judged {
         };
         return Judged::Incomplete(reason, reply.text);
     }
-    match check(&reply.text, lines, first_line) {
+    match check(&reply.text, section) {
         Ok(claims) => Judged::Claims(claims, reply.text),
         Err(problems) => Judged::Problems(problems, reply.text),
     }
 }
 
-/// The claims of a complete reply, or every problem found in it.
-fn check(reply: &str, lines: &[&str], first_line: usize) -> Result<Vec<Claim>, Vec<String>> {
+/// The claims of a complete reply, or every problem found in it. Each
+/// claim's lines, columns and quote come from the passages it names.
+fn check(reply: &str, section: &prompts::Section) -> Result<Vec<Claim>, Vec<String>> {
     let parsed: Value = serde_json::from_str(reply)
         .map_err(|err| vec![format!("The reply was not JSON: {err}.")])?;
-    let Some(list) = parsed["claims"].as_array() else {
+    let Some(list) = parsed[key::CLAIMS].as_array() else {
         return Err(vec!["The reply had no list of claims.".to_owned()]);
     };
+    let passages = section.passages;
     let mut claims = Vec::new();
     let mut problems = Vec::new();
     for (index, claim) in list.iter().enumerate() {
         let number = index + 1;
-        let text = claim["text"].as_str().unwrap_or("").trim();
-        let quote = claim["quote"].as_str().unwrap_or("");
+        let text = claim[key::TEXT].as_str().unwrap_or("").trim();
         // Capital letters in kinds aren't held to the schema's list.
-        let kind = claim["kind"].as_str().unwrap_or("").to_lowercase();
+        let kind = claim[key::KIND].as_str().unwrap_or("").to_lowercase();
         if text.is_empty() {
             problems.push(format!("Claim {number} has no text."));
+        }
+        // Pieces of the reply's own syntax inside a note mean the reply
+        // went wrong there.
+        if text.contains("\",\"") || text.contains("\":") {
+            problems.push(format!("Claim {number} has JSON syntax in its text."));
         }
         if !KINDS.contains(&kind.as_str()) {
             problems.push(format!("Claim {number} has the unknown kind \"{kind}\"."));
         }
-        let found = quotes::find(lines, first_line, quote);
-        if found.is_none() {
-            let shown: String = quote.chars().take(QUOTED).collect();
+        let span = span(passages, &claim[key::FIRST], &claim[key::LAST]);
+        if span.is_none() {
             problems.push(format!(
-                "Claim {number}: the quote \"{shown}\" does not appear in the section."
+                "Claim {number}: passages {} to {} are not passages of the section, which has \
+                 passages 1 to {}, first before last.",
+                claim[key::FIRST],
+                claim[key::LAST],
+                passages.len()
             ));
         }
-        if let (Some((start_line, end_line)), true) = (found, problems.is_empty()) {
+        if let (Some((from, to)), true) = (span, problems.is_empty()) {
             claims.push(Claim {
                 text: text.to_owned(),
                 kind,
-                illustrative: claim["illustrative"].as_bool().unwrap_or(false),
-                quote: quote.to_owned(),
-                start_line: start_line as i64,
-                end_line: end_line as i64,
+                illustrative: claim[key::ILLUSTRATIVE].as_bool().unwrap_or(false),
+                quote: passages::quote(section.lines, section.first_line, from, to),
+                start_line: from.line as i64,
+                end_line: to.line as i64,
+                start_column: Some(from.start_column as i64),
+                end_column: Some(to.end_column as i64),
             });
         }
     }
@@ -394,4 +420,18 @@ fn check(reply: &str, lines: &[&str], first_line: usize) -> Result<Vec<Claim>, V
     } else {
         Err(problems)
     }
+}
+
+/// The first and last passage a claim names, when both numbers are
+/// passages of the section and in order.
+fn span<'a>(
+    passages: &'a [Passage],
+    first: &Value,
+    last: &Value,
+) -> Option<(&'a Passage, &'a Passage)> {
+    let (first, last) = (first.as_u64()? as usize, last.as_u64()? as usize);
+    if first == 0 || first > last {
+        return None;
+    }
+    Some((passages.get(first - 1)?, passages.get(last - 1)?))
 }
