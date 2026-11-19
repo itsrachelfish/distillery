@@ -9,6 +9,7 @@ mod model;
 mod passages;
 mod progress;
 mod prompts;
+mod review;
 mod sections;
 mod snapshot;
 #[cfg(test)]

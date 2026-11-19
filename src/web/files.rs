@@ -12,7 +12,7 @@ use serde::Deserialize;
 
 use super::layout::{self, dollars, number};
 use super::sources::{self as source_pages, Snapshot};
-use super::{App, Flash, PageError, PageResult, estimates, internal, runs, usage, with_db};
+use super::{App, Flash, PageError, PageResult, estimates, internal, review, runs, usage, with_db};
 use crate::db::{
     self, Link, RecordedEstimate, RecordedGrouping, ShownClaim, ShownCompound, VersionStats,
 };
@@ -196,7 +196,9 @@ fn page(view: &View) -> Markup {
                 p.note {
                     (counted(view.claims.len() as u64, "claim", "claims"))
                     " extracted, shown under their sections. Every claim is an AI proposal "
-                    "until a reviewer confirms it."
+                    "until a reviewer confirms it. "
+                    a href=(review::href(source.id, &snapshot.commit, path)) { "Review the claims" }
+                    "."
                 }
             }
             table.lines {

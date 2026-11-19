@@ -14,6 +14,7 @@ mod files;
 mod groups;
 mod jobs;
 mod layout;
+mod review;
 mod runs;
 mod sources;
 mod usage;
@@ -43,6 +44,8 @@ struct App {
     db: Arc<PathBuf>,
     clone_dir: Arc<PathBuf>,
     model: Arc<config::Model>,
+    /// The reviewer recorded on every decision.
+    reviewer: Arc<str>,
     port: u16,
 }
 
@@ -53,6 +56,7 @@ pub fn run(config: &Config) -> db::Result<()> {
         db: Arc::new(config.storage.database.clone()),
         clone_dir: Arc::new(config.storage.clone_dir.clone()),
         model: Arc::new(config.model.clone()),
+        reviewer: Arc::from(config.review.reviewer.as_str()),
         port,
     };
     let router = Router::new()
@@ -62,6 +66,7 @@ pub fn run(config: &Config) -> db::Result<()> {
         .merge(estimates::routes())
         .merge(runs::routes())
         .merge(groups::routes())
+        .merge(review::routes())
         .merge(usage::routes())
         .route("/style.css", get(style))
         .fallback(not_found)

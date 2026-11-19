@@ -18,8 +18,8 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The schema, as the steps that build it. Steps are only ever added at the
 /// end: released steps never change.
-const MIGRATIONS: [&str; 7] = [
-    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7,
+const MIGRATIONS: [&str; 8] = [
+    SCHEMA_V1, SCHEMA_V2, SCHEMA_V3, SCHEMA_V4, SCHEMA_V5, SCHEMA_V6, SCHEMA_V7, SCHEMA_V8,
 ];
 
 const SCHEMA_V1: &str = "
@@ -295,6 +295,30 @@ CREATE TABLE claim_links (
     to_id INTEGER NOT NULL REFERENCES claims (id),
     relation TEXT NOT NULL
 );
+";
+
+const SCHEMA_V8: &str = "
+-- Review decisions, in the order made. Rows are never changed: a claim
+-- stands where its latest decision put it.
+CREATE TABLE decisions (
+    id INTEGER PRIMARY KEY,
+    claim_id INTEGER NOT NULL REFERENCES claims (id),
+    -- confirmed, edited, rejected or flagged. Edits confirm the claim with
+    -- new text.
+    decision TEXT NOT NULL,
+    -- Why: incorrect, out_of_date, needless or duplicate for rejections;
+    -- needs_edit or needs_source for flags.
+    category TEXT,
+    -- The claim's text after an edit.
+    text TEXT,
+    -- The reviewer's own words.
+    reason TEXT,
+    -- The review.reviewer setting when the decision was made.
+    reviewer TEXT NOT NULL,
+    -- UTC, as YYYY-MM-DD HH:MM:SS.
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX decisions_claim ON decisions (claim_id);
 ";
 
 /// Opens the database, creating it when the file is new and running the
@@ -1456,6 +1480,74 @@ pub fn links(conn: &Connection, grouping_id: i64) -> Result<Vec<Link>> {
             from_id: row.get(0)?,
             to_id: row.get(1)?,
             relation: row.get(2)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// A review decision about one claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decision {
+    pub claim_id: i64,
+    /// `confirmed`, `edited`, `rejected` or `flagged`.
+    pub decision: String,
+    /// Why a claim was rejected or flagged.
+    pub category: Option<String>,
+    /// The claim's text after an edit.
+    pub text: Option<String>,
+    /// The reviewer's own words.
+    pub reason: Option<String>,
+    pub reviewer: String,
+}
+
+/// Records decisions together: all of them or none.
+pub fn record_decisions(conn: &mut Connection, decisions: &[Decision]) -> Result<()> {
+    let transaction = conn.transaction()?;
+    for decision in decisions {
+        transaction.execute(
+            "INSERT INTO decisions (claim_id, decision, category, text, reason, reviewer)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                decision.claim_id,
+                decision.decision,
+                decision.category,
+                decision.text,
+                decision.reason,
+                decision.reviewer,
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// A decision with when it was made, in UTC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedDecision {
+    pub created_at: String,
+    pub decision: Decision,
+}
+
+/// Every decision about the claims with these IDs, in the order made.
+pub fn decisions(conn: &Connection, claim_ids: &[i64]) -> Result<Vec<RecordedDecision>> {
+    // IDs are numbers, so they are safe to write into the statement.
+    let ids: Vec<String> = claim_ids.iter().map(i64::to_string).collect();
+    let mut statement = conn.prepare(&format!(
+        "SELECT created_at, claim_id, decision, category, text, reason, reviewer
+         FROM decisions WHERE claim_id IN ({}) ORDER BY id",
+        ids.join(", ")
+    ))?;
+    let rows = statement.query_map([], |row| {
+        Ok(RecordedDecision {
+            created_at: row.get(0)?,
+            decision: Decision {
+                claim_id: row.get(1)?,
+                decision: row.get(2)?,
+                category: row.get(3)?,
+                text: row.get(4)?,
+                reason: row.get(5)?,
+                reviewer: row.get(6)?,
+            },
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
