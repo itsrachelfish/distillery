@@ -338,37 +338,205 @@ pre.reply {
     font-size: 0.85rem;
 }
 
-/* The Review page: one block per compound claim, one form per claim. */
+/* The steps a file goes through, shown on each of its pages. */
+nav.steps {
+    margin: 1rem 0 1.5rem;
+}
+
+nav.steps progress,
+progress.review {
+    width: 100%;
+}
+
+nav.steps ol {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.75rem;
+    margin: 0.5rem 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+nav.steps li {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.6rem 0.75rem;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--muted);
+}
+
+nav.steps li.done {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+nav.steps li.next {
+    border: 2px solid var(--accent);
+    color: var(--text);
+}
+
+nav.steps .marker {
+    display: inline-block;
+    width: 1.6rem;
+    height: 1.6rem;
+    border: 1px solid currentColor;
+    border-radius: 50%;
+    line-height: 1.5rem;
+    text-align: center;
+    font-weight: 600;
+}
+
+nav.steps li.done .marker {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--background);
+}
+
+nav.steps form {
+    margin: 0.25rem 0 0;
+}
+
+a.button {
+    display: inline-block;
+    padding: 0.4rem 0.9rem;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    text-decoration: none;
+}
+
+nav.steps li.next button,
+nav.steps li.next a.button,
+button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--background);
+    font-weight: 600;
+}
+
+/* The Review page: one claim at a time. */
+.review-progress {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+}
+
 section.review {
     margin: 1rem 0;
-    padding: 0.75rem 1rem;
+    padding: 1rem 1.25rem;
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: 6px;
 }
 
-section.review li {
-    margin-bottom: 0.9rem;
+section.review p.claim {
+    margin: 0.75rem 0;
+    font-size: 1.35rem;
+    font-weight: 600;
 }
 
-form.review {
+section.review blockquote {
+    margin: 0.25rem 0 0.5rem;
+    padding: 0.5rem 0.9rem;
+    border-left: 3px solid var(--accent);
+    background: var(--background);
+}
+
+section.review li {
+    margin-bottom: 0.6rem;
+}
+
+/* Two answers side by side: yes and no. */
+.answers {
     display: flex;
     flex-wrap: wrap;
-    gap: 0.35rem;
+    gap: 0.75rem;
     align-items: center;
-    margin: 0.35rem 0;
+    margin: 0.75rem 0;
 }
 
-form.review button,
-form.review input[type="text"],
+.answers button,
+.answers a.button {
+    min-width: 8rem;
+    padding: 0.8rem 1.5rem;
+    font-size: 1.15rem;
+    font-weight: 600;
+    text-align: center;
+}
+
+.answers input[type="text"] {
+    flex: 1;
+    min-width: 16rem;
+    padding: 0.8rem;
+    font-size: 1.05rem;
+}
+
+button.yes {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--background);
+}
+
+a.button.no {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+/* What is wrong: one answer per line. */
+form.options {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-width: 32rem;
+}
+
+form.options button,
+form.options a.button {
+    display: flex;
+    flex-direction: column;
+    padding: 0.7rem 1rem;
+    text-align: left;
+    font-weight: 600;
+}
+
+form.options .note {
+    font-weight: 400;
+}
+
+/* The decision just made, above the next claim. */
+p.decided {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    align-items: baseline;
+    padding: 0.5rem 0.75rem;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--muted);
+}
+
+p.decided .links {
+    display: flex;
+    gap: 1rem;
+    margin-left: auto;
+}
+
 select {
-    padding: 0.2rem 0.5rem;
+    padding: 0.4rem 0.6rem;
     background: var(--background);
     color: var(--text);
     border: 1px solid var(--border);
     border-radius: 6px;
     font: inherit;
-    font-size: 0.85rem;
+}
+
+p.turns {
+    display: flex;
+    justify-content: space-between;
 }
 
 .kind.confirmed {

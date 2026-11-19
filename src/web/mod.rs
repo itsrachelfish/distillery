@@ -17,6 +17,7 @@ mod layout;
 mod review;
 mod runs;
 mod sources;
+mod steps;
 mod usage;
 
 use std::fmt::Display;

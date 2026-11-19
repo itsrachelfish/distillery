@@ -11,6 +11,7 @@ use maud::{Markup, html};
 use rusqlite::Connection;
 use serde::Deserialize;
 
+use super::steps::{self, FileProgress};
 use super::{App, Flash, PageError, PageResult, files, internal, layout, with_db};
 use crate::db::{self, Revision, Source, SourceSummary};
 use crate::git;
@@ -107,17 +108,33 @@ async fn source_page(
     let clone_dir = app.clone_dir.clone();
     with_db(&app, move |conn| {
         let snapshot = snapshot(conn, &clone_dir, query.id, query.commit.as_deref())?;
+        // How far each file that runs have read has come.
+        let mut progress = Vec::new();
+        for (path, blob_hash) in
+            db::distilled_files(conn, snapshot.source.id, &snapshot.commit).map_err(internal)?
+        {
+            if snapshot.files.contains(&path) {
+                progress.push((path, steps::file_progress(conn, &blob_hash)?));
+            }
+        }
         Ok(layout::page(
             &snapshot.source.clone_folder,
             &flash,
-            source(&snapshot),
+            source(&snapshot, &progress),
         ))
     })
     .await
 }
 
-fn source(snapshot: &Snapshot) -> Markup {
+fn source(snapshot: &Snapshot, progress: &[(String, FileProgress)]) -> Markup {
     let source = &snapshot.source;
+    let of = |path: &str| {
+        progress
+            .iter()
+            .find(|(started, _)| started == path)
+            .map(|(_, progress)| progress)
+    };
+    let all: Vec<FileProgress> = progress.iter().map(|(_, progress)| *progress).collect();
     html! {
         p.crumbs { a href="/" { "Sources" } }
         h1 { (source.clone_folder) }
@@ -126,6 +143,8 @@ fn source(snapshot: &Snapshot) -> Markup {
             input type="hidden" name="url" value=(source.url);
             button type="submit" { "Fetch latest" }
         }
+
+        (steps::source(snapshot.files.len(), &all))
 
         h2 { "Markdown files at " (layout::commit(&snapshot.commit)) }
         @if snapshot.files.is_empty() {
@@ -142,6 +161,19 @@ fn source(snapshot: &Snapshot) -> Markup {
                                 " "
                             }
                             a href=(files::href(source.id, &snapshot.commit, path)) { (path) }
+                            @if let Some(progress) = of(path) {
+                                " "
+                                span.note {
+                                    @if progress.reviewed() {
+                                        "· reviewed"
+                                    } @else if progress.grouped() {
+                                        "· " (progress.handled) " of " (progress.items) " reviewed"
+                                    } @else {
+                                        "· " (counted(progress.claims as u64, "claim", "claims"))
+                                        ", not grouped yet"
+                                    }
+                                }
+                            }
                         }
                     }
                 }

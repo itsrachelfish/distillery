@@ -12,7 +12,8 @@ use serde::Deserialize;
 
 use super::layout::{self, dollars, number};
 use super::sources::{self as source_pages, Snapshot};
-use super::{App, Flash, PageError, PageResult, estimates, internal, review, runs, usage, with_db};
+use super::steps::{self, FileProgress};
+use super::{App, Flash, PageError, PageResult, estimates, internal, runs, usage, with_db};
 use crate::db::{
     self, Link, RecordedEstimate, RecordedGrouping, ShownClaim, ShownCompound, VersionStats,
 };
@@ -68,6 +69,7 @@ async fn file_page(
             .map_err(PageError::internal)?;
         let claims = db::claims_of_blob(conn, &blob_hash).map_err(internal)?;
         let versions = db::version_stats(conn, Some(&blob_hash)).map_err(internal)?;
+        let progress = steps::file_progress(conn, &blob_hash)?;
         // The latest grouping, and whether it grouped the claims shown.
         let grouping = db::latest_grouping(conn, &blob_hash).map_err(internal)?;
         let (compounds, links, current) = match &grouping {
@@ -91,6 +93,7 @@ async fn file_page(
             compounds: &compounds,
             links: &links,
             grouping_current: current,
+            progress: &progress,
         };
         Ok(layout::page(&query.path, &flash, page(&view)))
     })
@@ -117,6 +120,8 @@ struct View<'a> {
     links: &'a [Link],
     /// Whether it grouped exactly the claims shown.
     grouping_current: bool,
+    /// How far the file has come through its steps.
+    progress: &'a FileProgress,
 }
 
 fn page(view: &View) -> Markup {
@@ -163,21 +168,14 @@ fn page(view: &View) -> Markup {
             "Sections run from one heading to the next. Each is sent to the model on its own, "
             "with the headings above it as context."
         }
-        @if view.claims.len() >= group::FEWEST_CLAIMS {
-            (grouped(view))
-        }
         @if lines.is_empty() {
             p.empty { "This file is empty." }
         } @else {
-            form.inline method="post" action="/estimate" {
-                input type="hidden" name="source" value=(source.id);
-                input type="hidden" name="commit" value=(snapshot.commit);
-                input type="hidden" name="path" value=(path);
-                button type="submit" { "Distill" }
-                span.note {
-                    "Starts with an estimate: tokens are counted section by section, which "
-                    "is free, and the expected cost is shown before anything runs."
-                }
+            (steps::file(view.progress, source.id, &snapshot.commit, path))
+            p.note {
+                "Distilling starts with an estimate: tokens are counted section by section, "
+                "which is free, and the expected cost is shown before anything runs. Grouping "
+                "is one call to the model per file, and the same claims are never sent twice."
             }
             @if let Some(recorded) = estimate {
                 p.note {
@@ -192,13 +190,15 @@ fn page(view: &View) -> Markup {
                     }
                 }
             }
+            @if view.grouping.is_some() {
+                (grouped(view))
+            }
+            h2 { "Source and claims" }
             @if !view.claims.is_empty() {
                 p.note {
                     (counted(view.claims.len() as u64, "claim", "claims"))
-                    " extracted, shown under their sections. Every claim is an AI proposal "
-                    "until a reviewer confirms it. "
-                    a href=(review::href(source.id, &snapshot.commit, path)) { "Review the claims" }
-                    "."
+                    " shown under their sections. Every claim is an AI proposal until a "
+                    "reviewer confirms it."
                 }
             }
             table.lines {
@@ -279,11 +279,8 @@ fn claims(found: &[&ShownClaim]) -> Markup {
     }
 }
 
-/// The file's compound claims, and the button that groups its claims. The
-/// button is the only thing that starts a grouping call, and it shows only
-/// while the claims shown aren't grouped.
+/// The file's compound claims, from its latest grouping.
 fn grouped(view: &View) -> Markup {
-    let source = &view.snapshot.source;
     let claim = |id: i64| view.claims.iter().find(|shown| shown.id == id);
     let chars = |text: &str| text.chars().count();
     // How much shorter the compound claims are than the claims they hold.
@@ -301,19 +298,6 @@ fn grouped(view: &View) -> Markup {
         .sum();
     html! {
         h2 { "Compound claims" }
-        @if !view.grouping_current {
-            form.inline method="post" action="/group" {
-                input type="hidden" name="source" value=(source.id);
-                input type="hidden" name="commit" value=(view.snapshot.commit);
-                input type="hidden" name="path" value=(view.path);
-                button type="submit" { "Group claims" }
-                span.note {
-                    "One call to the model with "
-                    (counted(view.claims.len() as u64, "claim", "claims"))
-                    ". Only this button starts it, and the same claims are never sent twice."
-                }
-            }
-        }
         @if let Some(recorded) = view.grouping {
             @let grouping = &recorded.grouping;
             @if let Some(reason) = &grouping.reason {

@@ -1299,6 +1299,24 @@ pub fn claims_of_blob(conn: &Connection, blob_hash: &str) -> Result<Vec<ShownCla
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// The files of a source that runs have read at a commit: each path with
+/// the hash of its contents, sorted by path.
+pub fn distilled_files(
+    conn: &Connection,
+    source_id: i64,
+    commit_hash: &str,
+) -> Result<Vec<(String, String)>> {
+    let mut statement = conn.prepare(
+        "SELECT DISTINCT run_files.path, run_files.blob_hash
+         FROM run_files JOIN runs ON runs.id = run_files.run_id
+         WHERE runs.source_id = ?1 AND runs.commit_hash = ?2 ORDER BY run_files.path",
+    )?;
+    let rows = statement.query_map(params![source_id, commit_hash], |row| {
+        Ok((row.get(0)?, row.get(1)?))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// A grouping to record: what was sent, what came back and what it used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Grouping {
